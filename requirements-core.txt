@@ -1,0 +1,95 @@
+# Core Dependencies for Data Science Toolkit
+# This file excludes packages that require system-level dependencies
+
+# Core Data Science Libraries
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+
+# Machine Learning Libraries
+xgboost>=1.5.0
+lightgbm>=3.0.0
+catboost>=1.0.0
+
+# Deep Learning Libraries (choose based on your hardware)
+# For CPU only:
+torch>=1.10.0
+# For GPU with CUDA (uncomment and comment CPU version):
+# torch>=1.10.0+cu113 -f https://download.pytorch.org/whl/torch_stable.html
+
+# TensorFlow as alternative (uncomment if preferred over PyTorch):
+# tensorflow>=2.7.0
+
+# Data Visualization
+matplotlib>=3.4.0
+seaborn>=0.11.0
+plotly>=5.0.0
+
+# Statistical Libraries
+statsmodels>=0.12.0
+
+# Feature Engineering
+category_encoders>=2.3.0
+imbalanced-learn>=0.8.0
+
+# File I/O and Data Formats
+pyarrow>=6.0.0  # For Parquet support
+openpyxl>=3.0.0  # Excel support
+xlrd>=2.0.0  # Legacy Excel support
+h5py>=3.0.0  # HDF5 support
+
+# API and Web
+requests>=2.26.0
+aiohttp>=3.8.0  # Async HTTP
+
+# Parallel and Distributed Computing
+joblib>=1.1.0
+dask[complete]>=2021.10.0  # Using 'complete' instead of 'distributed' to avoid some issues
+
+# CLI and Logging
+click>=8.0.0
+colorama>=0.4.4  # Cross-platform colored terminal text
+colorlog>=6.6.0  # Colored logging
+tqdm>=4.62.0  # Progress bars
+
+# Model Interpretation and Explanation
+shap>=0.40.0  # SHAP values
+lime>=0.2.0  # Local interpretable model explanations
+
+# Time Series
+statsmodels>=0.12.0  # Already included above
+pmdarima>=1.8.0  # Auto-ARIMA
+
+# Optimization
+optuna>=2.10.0  # Hyperparameter optimization
+
+# Testing and Development
+pytest>=6.2.0
+pytest-cov>=3.0.0
+
+# Utilities
+pyyaml>=5.4.0  # YAML support
+python-dotenv>=0.19.0  # Environment variables
+humanize>=3.12.0  # Human-readable numbers
+tabulate>=0.8.0  # Table formatting
+
+# Notebook Support
+jupyter>=1.0.0
+ipywidgets>=7.6.0
+
+# Additional ML Libraries
+yellowbrick>=1.3.0  # ML visualization
+
+# Caching and Performance
+numexpr>=2.7.0  # Fast numerical expressions
+bottleneck>=1.3.0  # Fast NumPy array functions
+
+# Data Quality and Profiling
+missingno>=0.5.0  # Missing data visualization
+
+# Note: Database drivers are excluded from this file
+# Install them separately based on your needs:
+# - PostgreSQL: pip install psycopg2-binary
+# - MySQL: See instructions in README for system dependencies
+# - MongoDB: pip install pymongo (no system deps required)
