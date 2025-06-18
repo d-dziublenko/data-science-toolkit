@@ -7,7 +7,8 @@ from .data_loader import (
     DataLoader,
     TabularDataLoader,
     GeospatialDataLoader,
-    ModelLoader
+    ModelLoader,
+    DatasetSplitter
 )
 
 from .preprocessing import (
@@ -37,6 +38,7 @@ __all__ = [
     'TabularDataLoader',
     'GeospatialDataLoader',
     'ModelLoader',
+    'DatasetSplitter',
     
     # Preprocessing
     'DataPreprocessor',

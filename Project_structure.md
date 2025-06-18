@@ -1,7 +1,13 @@
 """
 Universal Data Science Toolkit Project Structure
 
-data_science_toolkit/
+author - Dmytro Dziublenko
+email - d.dziublenko@gmail.com
+license - AGPL-3.0 license
+git clone link - https://github.com/d-dziublenko/data-science-toolkit.git
+web link - https://github.com/d-dziublenko/data-science-toolkit
+
+data-science-toolkit/
 │
 ├── core/
 │   ├── __init__.py

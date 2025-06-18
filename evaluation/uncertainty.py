@@ -7,14 +7,789 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Union, Any, Tuple, Callable
 from sklearn.model_selection import KFold
-from sklearn.base import clone
+from sklearn.base import clone, BaseEstimator
 from sklearn.utils import resample
+from sklearn.isotonic import IsotonicRegression
+from sklearn.calibration import CalibratedClassifierCV
 from scipy import stats
+from scipy.stats import norm, t
 import logging
 from tqdm import tqdm
 import warnings
+from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
+
+
+class UncertaintyEstimator(ABC):
+    """Abstract base class for uncertainty estimation methods."""
+    
+    @abstractmethod
+    def fit(self, *args, **kwargs):
+        """Fit the uncertainty estimator."""
+        pass
+    
+    @abstractmethod
+    def predict_uncertainty(self, *args, **kwargs) -> Dict[str, np.ndarray]:
+        """Predict with uncertainty estimates."""
+        pass
+
+
+class BootstrapUncertainty(UncertaintyEstimator):
+    """
+    Bootstrap-based uncertainty estimation.
+    
+    This class implements bootstrap resampling to estimate prediction uncertainty
+    by training multiple models on different bootstrap samples of the data.
+    """
+    
+    def __init__(self, 
+                 base_estimator: BaseEstimator,
+                 n_bootstrap: int = 100,
+                 sample_fraction: float = 1.0,
+                 random_state: Optional[int] = None):
+        """
+        Initialize Bootstrap uncertainty estimator.
+        
+        Args:
+            base_estimator: Base model to use (will be cloned)
+            n_bootstrap: Number of bootstrap iterations
+            sample_fraction: Fraction of data to use in each bootstrap sample
+            random_state: Random seed for reproducibility
+        """
+        self.base_estimator = base_estimator
+        self.n_bootstrap = n_bootstrap
+        self.sample_fraction = sample_fraction
+        self.random_state = random_state
+        self.estimators_ = []
+        self.is_fitted_ = False
+    
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        """
+        Fit bootstrap models.
+        
+        Args:
+            X: Training features
+            y: Training targets
+        """
+        logger.info(f"Fitting {self.n_bootstrap} bootstrap models")
+        
+        n_samples = len(X)
+        sample_size = int(self.sample_fraction * n_samples)
+        
+        # Set random state
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+        
+        # Train bootstrap models
+        for i in tqdm(range(self.n_bootstrap), desc="Bootstrap fitting"):
+            # Create bootstrap sample
+            indices = np.random.choice(n_samples, size=sample_size, replace=True)
+            X_bootstrap = X.iloc[indices]
+            y_bootstrap = y.iloc[indices]
+            
+            # Clone and train model
+            model = clone(self.base_estimator)
+            model.fit(X_bootstrap, y_bootstrap)
+            self.estimators_.append(model)
+        
+        self.is_fitted_ = True
+        return self
+    
+    def predict_uncertainty(self, 
+                          X: pd.DataFrame, 
+                          confidence_level: float = 0.95) -> Dict[str, np.ndarray]:
+        """
+        Make predictions with uncertainty estimates.
+        
+        Args:
+            X: Features to predict on
+            confidence_level: Confidence level for intervals
+            
+        Returns:
+            Dictionary with predictions and uncertainty estimates
+        """
+        if not self.is_fitted_:
+            raise ValueError("Must fit before predicting")
+        
+        # Get predictions from all models
+        predictions = []
+        for model in self.estimators_:
+            pred = model.predict(X)
+            predictions.append(pred)
+        
+        predictions = np.array(predictions)
+        
+        # Calculate statistics
+        mean_pred = np.mean(predictions, axis=0)
+        std_pred = np.std(predictions, axis=0)
+        
+        # Calculate confidence intervals
+        alpha = 1 - confidence_level
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        
+        lower_bound = np.percentile(predictions, lower_percentile, axis=0)
+        upper_bound = np.percentile(predictions, upper_percentile, axis=0)
+        
+        return {
+            'predictions': mean_pred,
+            'lower_bound': lower_bound,
+            'upper_bound': upper_bound,
+            'std': std_pred,
+            'all_predictions': predictions
+        }
+
+
+class BayesianUncertainty(UncertaintyEstimator):
+    """
+    Bayesian approach to uncertainty estimation.
+    
+    This class implements Bayesian uncertainty estimation using either
+    variational inference or MCMC sampling, depending on the model type.
+    """
+    
+    def __init__(self, 
+                 model_type: str = "linear",
+                 prior_params: Optional[Dict[str, Any]] = None,
+                 n_samples: int = 1000):
+        """
+        Initialize Bayesian uncertainty estimator.
+        
+        Args:
+            model_type: Type of Bayesian model ('linear', 'neural', 'gaussian_process')
+            prior_params: Parameters for prior distributions
+            n_samples: Number of posterior samples
+        """
+        self.model_type = model_type
+        self.prior_params = prior_params or {}
+        self.n_samples = n_samples
+        self.posterior_samples_ = None
+        self.is_fitted_ = False
+        
+        # Initialize model based on type
+        self._init_model()
+    
+    def _init_model(self):
+        """Initialize the specific Bayesian model."""
+        if self.model_type == "linear":
+            # Bayesian linear regression
+            self.alpha_ = self.prior_params.get('alpha', 1.0)  # Precision of weights
+            self.beta_ = self.prior_params.get('beta', 1.0)   # Precision of noise
+        elif self.model_type == "gaussian_process":
+            # Import here to avoid dependency if not used
+            try:
+                from sklearn.gaussian_process import GaussianProcessRegressor
+                from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+                
+                kernel = RBF() + WhiteKernel()
+                self.model = GaussianProcessRegressor(
+                    kernel=kernel,
+                    n_restarts_optimizer=self.prior_params.get('n_restarts', 5),
+                    alpha=self.prior_params.get('noise_level', 1e-6)
+                )
+            except ImportError:
+                raise ImportError("Gaussian Process requires scikit-learn with GP support")
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+    
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        """
+        Fit the Bayesian model.
+        
+        Args:
+            X: Training features
+            y: Training targets
+        """
+        logger.info(f"Fitting Bayesian {self.model_type} model")
+        
+        if self.model_type == "linear":
+            # Bayesian linear regression with conjugate priors
+            X_array = X.values
+            y_array = y.values
+            
+            # Add bias term
+            X_with_bias = np.column_stack([np.ones(len(X)), X_array])
+            
+            # Posterior parameters (conjugate update)
+            S_inv = self.alpha_ * np.eye(X_with_bias.shape[1]) + self.beta_ * X_with_bias.T @ X_with_bias
+            S = np.linalg.inv(S_inv)
+            m = self.beta_ * S @ X_with_bias.T @ y_array
+            
+            # Store posterior parameters
+            self.posterior_mean_ = m
+            self.posterior_cov_ = S
+            
+            # Sample from posterior
+            self.posterior_samples_ = np.random.multivariate_normal(
+                self.posterior_mean_, self.posterior_cov_, size=self.n_samples
+            )
+            
+        elif self.model_type == "gaussian_process":
+            self.model.fit(X, y)
+        
+        self.is_fitted_ = True
+        return self
+    
+    def predict_uncertainty(self, 
+                          X: pd.DataFrame,
+                          confidence_level: float = 0.95) -> Dict[str, np.ndarray]:
+        """
+        Make predictions with Bayesian uncertainty estimates.
+        
+        Args:
+            X: Features to predict on
+            confidence_level: Confidence level for intervals
+            
+        Returns:
+            Dictionary with predictions and uncertainty estimates
+        """
+        if not self.is_fitted_:
+            raise ValueError("Must fit before predicting")
+        
+        if self.model_type == "linear":
+            X_array = X.values
+            X_with_bias = np.column_stack([np.ones(len(X)), X_array])
+            
+            # Predictive distribution
+            predictions = []
+            for weights in self.posterior_samples_:
+                pred = X_with_bias @ weights
+                # Add observation noise
+                pred += np.random.normal(0, 1/np.sqrt(self.beta_), size=len(pred))
+                predictions.append(pred)
+            
+            predictions = np.array(predictions)
+            
+            # Calculate statistics
+            mean_pred = np.mean(predictions, axis=0)
+            std_pred = np.std(predictions, axis=0)
+            
+            # Confidence intervals
+            alpha = 1 - confidence_level
+            lower_bound = np.percentile(predictions, (alpha/2) * 100, axis=0)
+            upper_bound = np.percentile(predictions, (1 - alpha/2) * 100, axis=0)
+            
+        elif self.model_type == "gaussian_process":
+            mean_pred, std_pred = self.model.predict(X, return_std=True)
+            
+            # Confidence intervals (assuming normal distribution)
+            z_score = norm.ppf(1 - (1 - confidence_level) / 2)
+            lower_bound = mean_pred - z_score * std_pred
+            upper_bound = mean_pred + z_score * std_pred
+            
+            predictions = None  # GP doesn't generate samples by default
+        
+        return {
+            'predictions': mean_pred,
+            'lower_bound': lower_bound,
+            'upper_bound': upper_bound,
+            'std': std_pred,
+            'epistemic_uncertainty': std_pred,  # Bayesian methods capture epistemic uncertainty
+            'all_predictions': predictions
+        }
+
+
+class EnsembleUncertainty(UncertaintyEstimator):
+    """
+    Ensemble-based uncertainty estimation.
+    
+    This class uses an ensemble of diverse models to estimate uncertainty
+    through their disagreement.
+    """
+    
+    def __init__(self, 
+                 estimators: List[BaseEstimator],
+                 voting: str = 'soft',
+                 weights: Optional[List[float]] = None):
+        """
+        Initialize Ensemble uncertainty estimator.
+        
+        Args:
+            estimators: List of base estimators
+            voting: Voting type ('soft' for averaging, 'hard' for majority)
+            weights: Optional weights for each estimator
+        """
+        self.estimators = estimators
+        self.voting = voting
+        self.weights = weights
+        self.is_fitted_ = False
+    
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        """
+        Fit all ensemble members.
+        
+        Args:
+            X: Training features
+            y: Training targets
+        """
+        logger.info(f"Fitting ensemble of {len(self.estimators)} models")
+        
+        for i, estimator in enumerate(self.estimators):
+            logger.debug(f"Fitting model {i+1}/{len(self.estimators)}: {type(estimator).__name__}")
+            estimator.fit(X, y)
+        
+        self.is_fitted_ = True
+        return self
+    
+    def predict_uncertainty(self,
+                          X: pd.DataFrame,
+                          confidence_level: float = 0.95) -> Dict[str, np.ndarray]:
+        """
+        Make predictions with ensemble uncertainty.
+        
+        Args:
+            X: Features to predict on
+            confidence_level: Confidence level for intervals
+            
+        Returns:
+            Dictionary with predictions and uncertainty estimates
+        """
+        if not self.is_fitted_:
+            raise ValueError("Must fit before predicting")
+        
+        # Get predictions from all models
+        predictions = []
+        for estimator in self.estimators:
+            if hasattr(estimator, 'predict_proba') and self.voting == 'soft':
+                # For classification with soft voting
+                pred = estimator.predict_proba(X)
+            else:
+                pred = estimator.predict(X)
+            predictions.append(pred)
+        
+        predictions = np.array(predictions)
+        
+        # Apply weights if provided
+        if self.weights is not None:
+            weights = np.array(self.weights).reshape(-1, 1)
+            if len(predictions.shape) == 3:  # Classification probabilities
+                weights = weights.reshape(-1, 1, 1)
+            weighted_predictions = predictions * weights
+            mean_pred = np.sum(weighted_predictions, axis=0) / np.sum(self.weights)
+        else:
+            mean_pred = np.mean(predictions, axis=0)
+        
+        # Calculate uncertainty metrics
+        if len(predictions.shape) == 2:  # Regression
+            std_pred = np.std(predictions, axis=0)
+            
+            # Confidence intervals
+            alpha = 1 - confidence_level
+            lower_bound = np.percentile(predictions, (alpha/2) * 100, axis=0)
+            upper_bound = np.percentile(predictions, (1 - alpha/2) * 100, axis=0)
+            
+            # Disagreement metric
+            disagreement = std_pred / (np.abs(mean_pred) + 1e-8)
+            
+            return {
+                'predictions': mean_pred,
+                'lower_bound': lower_bound,
+                'upper_bound': upper_bound,
+                'std': std_pred,
+                'disagreement': disagreement,
+                'all_predictions': predictions
+            }
+        else:  # Classification
+            # For probability predictions
+            std_pred = np.std(predictions, axis=0)
+            
+            # Entropy as uncertainty measure
+            entropy = -np.sum(mean_pred * np.log(mean_pred + 1e-10), axis=1)
+            
+            # Prediction disagreement
+            class_predictions = np.argmax(predictions, axis=2)
+            mode_predictions = stats.mode(class_predictions, axis=0)[0].ravel()
+            disagreement = 1 - (np.sum(class_predictions == mode_predictions[np.newaxis, :], axis=0) / len(self.estimators))
+            
+            return {
+                'predictions': np.argmax(mean_pred, axis=1),
+                'probabilities': mean_pred,
+                'std': std_pred,
+                'entropy': entropy,
+                'disagreement': disagreement,
+                'all_predictions': predictions
+            }
+
+
+class PredictionInterval:
+    """
+    Methods for constructing prediction intervals.
+    
+    This class implements various methods for creating prediction intervals
+    including conformal prediction and quantile-based approaches.
+    """
+    
+    def __init__(self, method: str = "conformal", alpha: float = 0.1):
+        """
+        Initialize prediction interval constructor.
+        
+        Args:
+            method: Method for interval construction ('conformal', 'quantile', 'residual')
+            alpha: Significance level (1 - alpha is the confidence level)
+        """
+        self.method = method
+        self.alpha = alpha
+        self.calibration_scores_ = None
+        self.quantile_models_ = None
+        self.residual_model_ = None
+    
+    def fit(self, 
+            model: BaseEstimator,
+            X_train: pd.DataFrame,
+            y_train: pd.Series,
+            X_cal: Optional[pd.DataFrame] = None,
+            y_cal: Optional[pd.Series] = None):
+        """
+        Fit the prediction interval method.
+        
+        Args:
+            model: Fitted model
+            X_train: Training features
+            y_train: Training targets
+            X_cal: Calibration features (for conformal)
+            y_cal: Calibration targets (for conformal)
+        """
+        if self.method == "conformal":
+            self._fit_conformal(model, X_train, y_train, X_cal, y_cal)
+        elif self.method == "quantile":
+            self._fit_quantile(X_train, y_train)
+        elif self.method == "residual":
+            self._fit_residual(model, X_train, y_train)
+        else:
+            raise ValueError(f"Unknown method: {self.method}")
+    
+    def _fit_conformal(self, model, X_train, y_train, X_cal, y_cal):
+        """Fit conformal prediction intervals."""
+        # If no calibration set provided, use part of training set
+        if X_cal is None or y_cal is None:
+            from sklearn.model_selection import train_test_split
+            X_train, X_cal, y_train, y_cal = train_test_split(
+                X_train, y_train, test_size=0.2, random_state=42
+            )
+            # Refit model on reduced training set
+            model.fit(X_train, y_train)
+        
+        # Calculate conformity scores on calibration set
+        predictions = model.predict(X_cal)
+        self.calibration_scores_ = np.abs(y_cal - predictions)
+        
+        # Store the model for later use
+        self.model_ = model
+    
+    def _fit_quantile(self, X_train, y_train):
+        """Fit quantile regression models."""
+        try:
+            from sklearn.ensemble import GradientBoostingRegressor
+            
+            # Fit models for lower and upper quantiles
+            lower_quantile = self.alpha / 2
+            upper_quantile = 1 - self.alpha / 2
+            
+            self.quantile_models_ = {
+                'lower': GradientBoostingRegressor(loss='quantile', alpha=lower_quantile),
+                'median': GradientBoostingRegressor(loss='quantile', alpha=0.5),
+                'upper': GradientBoostingRegressor(loss='quantile', alpha=upper_quantile)
+            }
+            
+            for name, model in self.quantile_models_.items():
+                logger.info(f"Fitting {name} quantile model")
+                model.fit(X_train, y_train)
+                
+        except ImportError:
+            raise ImportError("Quantile regression requires scikit-learn with GradientBoostingRegressor")
+    
+    def _fit_residual(self, model, X_train, y_train):
+        """Fit residual-based prediction intervals."""
+        # Get predictions on training set
+        predictions = model.predict(X_train)
+        residuals = y_train - predictions
+        
+        # Fit a model to predict absolute residuals
+        abs_residuals = np.abs(residuals)
+        
+        try:
+            from sklearn.ensemble import RandomForestRegressor
+            self.residual_model_ = RandomForestRegressor(n_estimators=100)
+            self.residual_model_.fit(X_train, abs_residuals)
+        except ImportError:
+            # Fallback to simple standard deviation
+            self.residual_std_ = np.std(residuals)
+        
+        self.model_ = model
+    
+    def predict_interval(self, X: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """
+        Predict with intervals.
+        
+        Args:
+            X: Features to predict on
+            
+        Returns:
+            Dictionary with predictions and intervals
+        """
+        if self.method == "conformal":
+            return self._predict_conformal(X)
+        elif self.method == "quantile":
+            return self._predict_quantile(X)
+        elif self.method == "residual":
+            return self._predict_residual(X)
+    
+    def _predict_conformal(self, X):
+        """Conformal prediction intervals."""
+        predictions = self.model_.predict(X)
+        
+        # Calculate the (1-alpha) quantile of calibration scores
+        n_cal = len(self.calibration_scores_)
+        q_level = np.ceil((n_cal + 1) * (1 - self.alpha)) / n_cal
+        q_level = np.clip(q_level, 0, 1)
+        quantile = np.quantile(self.calibration_scores_, q_level)
+        
+        # Construct intervals
+        lower_bound = predictions - quantile
+        upper_bound = predictions + quantile
+        
+        return {
+            'predictions': predictions,
+            'lower_bound': lower_bound,
+            'upper_bound': upper_bound,
+            'interval_width': 2 * quantile
+        }
+    
+    def _predict_quantile(self, X):
+        """Quantile regression intervals."""
+        lower_bound = self.quantile_models_['lower'].predict(X)
+        predictions = self.quantile_models_['median'].predict(X)
+        upper_bound = self.quantile_models_['upper'].predict(X)
+        
+        return {
+            'predictions': predictions,
+            'lower_bound': lower_bound,
+            'upper_bound': upper_bound,
+            'interval_width': upper_bound - lower_bound
+        }
+    
+    def _predict_residual(self, X):
+        """Residual-based prediction intervals."""
+        predictions = self.model_.predict(X)
+        
+        if hasattr(self, 'residual_model_'):
+            # Predict residual magnitude
+            residual_pred = self.residual_model_.predict(X)
+            # Use t-distribution for small samples
+            t_value = t.ppf(1 - self.alpha/2, df=max(len(X) - 1, 1))
+            margin = t_value * residual_pred
+        else:
+            # Use constant residual estimate
+            z_value = norm.ppf(1 - self.alpha/2)
+            margin = z_value * self.residual_std_
+        
+        return {
+            'predictions': predictions,
+            'lower_bound': predictions - margin,
+            'upper_bound': predictions + margin,
+            'interval_width': 2 * margin
+        }
+
+
+class CalibrationAnalyzer:
+    """
+    Analyze and improve calibration of uncertainty estimates.
+    
+    This class provides methods to assess and recalibrate prediction intervals
+    and probability estimates.
+    """
+    
+    def __init__(self, task_type: str = "regression"):
+        """
+        Initialize calibration analyzer.
+        
+        Args:
+            task_type: Type of task ('regression' or 'classification')
+        """
+        self.task_type = task_type
+        self.calibration_function_ = None
+        self.calibration_metrics_ = {}
+    
+    def analyze_calibration(self,
+                          y_true: np.ndarray,
+                          y_pred: np.ndarray,
+                          y_lower: Optional[np.ndarray] = None,
+                          y_upper: Optional[np.ndarray] = None,
+                          y_proba: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Analyze calibration of predictions.
+        
+        Args:
+            y_true: True values
+            y_pred: Predictions
+            y_lower: Lower bounds (for regression)
+            y_upper: Upper bounds (for regression)
+            y_proba: Predicted probabilities (for classification)
+            
+        Returns:
+            Dictionary with calibration metrics
+        """
+        if self.task_type == "regression":
+            return self._analyze_regression_calibration(y_true, y_pred, y_lower, y_upper)
+        else:
+            return self._analyze_classification_calibration(y_true, y_pred, y_proba)
+    
+    def _analyze_regression_calibration(self, y_true, y_pred, y_lower, y_upper):
+        """Analyze calibration for regression intervals."""
+        metrics = {}
+        
+        if y_lower is not None and y_upper is not None:
+            # Coverage analysis
+            in_interval = (y_true >= y_lower) & (y_true <= y_upper)
+            coverage = np.mean(in_interval)
+            metrics['coverage'] = coverage
+            
+            # Width analysis
+            widths = y_upper - y_lower
+            metrics['mean_width'] = np.mean(widths)
+            metrics['median_width'] = np.median(widths)
+            
+            # Conditional coverage (by predicted value bins)
+            n_bins = 10
+            pred_bins = pd.qcut(y_pred, q=n_bins, duplicates='drop')
+            conditional_coverage = []
+            
+            for bin_label in pred_bins.cat.categories:
+                bin_mask = pred_bins == bin_label
+                if np.sum(bin_mask) > 0:
+                    bin_coverage = np.mean(in_interval[bin_mask])
+                    conditional_coverage.append(bin_coverage)
+            
+            metrics['conditional_coverage'] = conditional_coverage
+            metrics['coverage_std'] = np.std(conditional_coverage)
+        
+        # Sharpness (how tight are the predictions)
+        residuals = y_true - y_pred
+        metrics['rmse'] = np.sqrt(np.mean(residuals**2))
+        metrics['mae'] = np.mean(np.abs(residuals))
+        
+        self.calibration_metrics_ = metrics
+        return metrics
+    
+    def _analyze_classification_calibration(self, y_true, y_pred, y_proba):
+        """Analyze calibration for classification probabilities."""
+        metrics = {}
+        
+        if y_proba is not None:
+            # Binary classification calibration
+            if y_proba.shape[1] == 2:
+                from sklearn.calibration import calibration_curve
+                
+                # Get calibration curve
+                fraction_positive, mean_predicted = calibration_curve(
+                    y_true, y_proba[:, 1], n_bins=10
+                )
+                
+                # Expected Calibration Error (ECE)
+                bin_weights = np.histogram(y_proba[:, 1], bins=10)[0] / len(y_proba)
+                ece = np.sum(bin_weights * np.abs(fraction_positive - mean_predicted))
+                
+                metrics['ece'] = ece
+                metrics['calibration_curve'] = {
+                    'fraction_positive': fraction_positive,
+                    'mean_predicted': mean_predicted
+                }
+            
+            # Brier score
+            from sklearn.metrics import brier_score_loss
+            if y_proba.shape[1] == 2:
+                brier = brier_score_loss(y_true, y_proba[:, 1])
+                metrics['brier_score'] = brier
+        
+        # Confidence calibration
+        max_proba = np.max(y_proba, axis=1)
+        correct = y_pred == y_true
+        
+        # Bin by confidence
+        conf_bins = np.linspace(0, 1, 11)
+        calibration_data = []
+        
+        for i in range(len(conf_bins) - 1):
+            mask = (max_proba >= conf_bins[i]) & (max_proba < conf_bins[i+1])
+            if np.sum(mask) > 0:
+                accuracy = np.mean(correct[mask])
+                avg_confidence = np.mean(max_proba[mask])
+                calibration_data.append({
+                    'confidence': avg_confidence,
+                    'accuracy': accuracy,
+                    'count': np.sum(mask)
+                })
+        
+        metrics['confidence_calibration'] = calibration_data
+        
+        self.calibration_metrics_ = metrics
+        return metrics
+    
+    def recalibrate(self,
+                   y_true: np.ndarray,
+                   y_pred: np.ndarray,
+                   y_proba: Optional[np.ndarray] = None,
+                   method: str = "isotonic") -> Union[np.ndarray, Callable]:
+        """
+        Recalibrate predictions.
+        
+        Args:
+            y_true: True values for calibration
+            y_pred: Predictions
+            y_proba: Predicted probabilities
+            method: Calibration method ('isotonic', 'platt', 'temperature')
+            
+        Returns:
+            Recalibrated predictions or calibration function
+        """
+        if self.task_type == "classification" and y_proba is not None:
+            if method == "isotonic":
+                # Isotonic regression calibration
+                iso_reg = IsotonicRegression(out_of_bounds='clip')
+                iso_reg.fit(y_proba[:, 1], y_true)
+                self.calibration_function_ = iso_reg
+                return iso_reg.transform(y_proba[:, 1])
+                
+            elif method == "platt":
+                # Platt scaling (logistic regression)
+                from sklearn.linear_model import LogisticRegression
+                lr = LogisticRegression()
+                lr.fit(y_proba[:, 1].reshape(-1, 1), y_true)
+                self.calibration_function_ = lr
+                return lr.predict_proba(y_proba[:, 1].reshape(-1, 1))[:, 1]
+                
+            elif method == "temperature":
+                # Temperature scaling
+                temperature = self._optimize_temperature(y_true, y_proba)
+                self.calibration_function_ = lambda p: self._apply_temperature(p, temperature)
+                return self._apply_temperature(y_proba, temperature)
+        
+        else:
+            raise ValueError(f"Calibration method {method} not supported for {self.task_type}")
+    
+    def _optimize_temperature(self, y_true, y_proba, eps=1e-8):
+        """Optimize temperature scaling parameter."""
+        from scipy.optimize import minimize_scalar
+        
+        def nll(temperature):
+            # Apply temperature scaling
+            scaled_proba = self._apply_temperature(y_proba, temperature)
+            # Negative log likelihood
+            return -np.mean(np.log(scaled_proba[range(len(y_true)), y_true] + eps))
+        
+        result = minimize_scalar(nll, bounds=(0.1, 10.0), method='bounded')
+        return result.x
+    
+    def _apply_temperature(self, proba, temperature):
+        """Apply temperature scaling to probabilities."""
+        # Apply temperature to logits
+        logits = np.log(proba + 1e-8)
+        scaled_logits = logits / temperature
+        
+        # Convert back to probabilities
+        exp_scaled = np.exp(scaled_logits)
+        return exp_scaled / np.sum(exp_scaled, axis=1, keepdims=True)
 
 
 class UncertaintyQuantifier:
@@ -93,16 +868,15 @@ class UncertaintyQuantifier:
             
             # Make predictions
             if self.task_type == 'regression':
-                predictions = model_clone.predict(X_test)
+                pred = model_clone.predict(X_test)
             else:
                 if hasattr(model_clone, 'predict_proba'):
-                    predictions = model_clone.predict_proba(X_test)
+                    pred = model_clone.predict_proba(X_test)
                 else:
-                    predictions = model_clone.predict(X_test)
+                    pred = model_clone.predict(X_test)
             
-            bootstrap_predictions.append(predictions)
+            bootstrap_predictions.append(pred)
         
-        # Convert to numpy array
         bootstrap_predictions = np.array(bootstrap_predictions)
         self.bootstrap_predictions = bootstrap_predictions
         
@@ -111,7 +885,7 @@ class UncertaintyQuantifier:
             mean_predictions = np.mean(bootstrap_predictions, axis=0)
             std_predictions = np.std(bootstrap_predictions, axis=0)
             
-            # Calculate confidence intervals
+            # Confidence intervals
             alpha = 1 - confidence_level
             lower_percentile = (alpha / 2) * 100
             upper_percentile = (1 - alpha / 2) * 100
@@ -127,68 +901,38 @@ class UncertaintyQuantifier:
                 'all_predictions': bootstrap_predictions
             }
         else:
-            # For classification
-            if len(bootstrap_predictions.shape) == 3:  # Probability predictions
-                mean_predictions = np.mean(bootstrap_predictions, axis=0)
-                std_predictions = np.std(bootstrap_predictions, axis=0)
-                
-                # Class predictions from mean probabilities
-                class_predictions = np.argmax(mean_predictions, axis=1)
-                
-                # Prediction entropy as uncertainty measure
-                prediction_entropy = -np.sum(mean_predictions * np.log(mean_predictions + 1e-10), axis=1)
-                
-                return {
-                    'predictions': class_predictions,
-                    'probabilities': mean_predictions,
-                    'std': std_predictions,
-                    'entropy': prediction_entropy,
-                    'all_predictions': bootstrap_predictions
-                }
-            else:  # Direct class predictions
-                # Mode of predictions
-                mode_predictions = stats.mode(bootstrap_predictions, axis=0)[0].ravel()
-                
-                # Disagreement rate as uncertainty
-                disagreement_rate = 1 - (np.sum(bootstrap_predictions == mode_predictions[np.newaxis, :], axis=0) / n_bootstrap)
-                
-                return {
-                    'predictions': mode_predictions,
-                    'disagreement_rate': disagreement_rate,
-                    'all_predictions': bootstrap_predictions
-                }
+            # Classification: process probability predictions
+            return self._process_classification_predictions(bootstrap_predictions, confidence_level)
     
     def cv_uncertainty(self,
                       model: Any,
                       X: pd.DataFrame,
                       y: pd.Series,
-                      cv_folds: int = 5,
+                      cv: int = 5,
                       confidence_level: float = 0.95) -> Dict[str, np.ndarray]:
         """
         Estimate uncertainty using cross-validation.
         
-        This method uses k-fold cross-validation to estimate prediction uncertainty
-        by training on different subsets of the data.
+        This method trains models on different CV folds and uses the variation
+        in predictions to estimate uncertainty.
         
         Args:
             model: Base model to use (will be cloned)
             X: Features
             y: Target
-            cv_folds: Number of cross-validation folds
+            cv: Number of cross-validation folds
             confidence_level: Confidence level for intervals
             
         Returns:
             Dictionary with uncertainty estimates
         """
-        logger.info(f"Starting CV uncertainty estimation with {cv_folds} folds")
+        logger.info(f"Starting CV uncertainty estimation with {cv} folds")
         
-        kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        predictions = {idx: [] for idx in range(len(X))}
+        kfold = KFold(n_splits=cv, shuffle=True, random_state=42)
+        predictions = []
         
-        # Cross-validation
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-            logger.debug(f"Processing fold {fold + 1}/{cv_folds}")
-            
+        # For each fold
+        for fold, (train_idx, val_idx) in enumerate(kfold.split(X)):
             X_train_fold = X.iloc[train_idx]
             y_train_fold = y.iloc[train_idx]
             X_val_fold = X.iloc[val_idx]
@@ -197,47 +941,49 @@ class UncertaintyQuantifier:
             model_clone = clone(model)
             model_clone.fit(X_train_fold, y_train_fold)
             
-            # Make predictions
+            # Store predictions for validation indices
             if self.task_type == 'regression':
-                fold_predictions = model_clone.predict(X_val_fold)
-                for idx, pred in zip(val_idx, fold_predictions):
-                    predictions[idx].append(pred)
+                pred = model_clone.predict(X_val_fold)
             else:
                 if hasattr(model_clone, 'predict_proba'):
-                    fold_predictions = model_clone.predict_proba(X_val_fold)
+                    pred = model_clone.predict_proba(X_val_fold)
                 else:
-                    fold_predictions = model_clone.predict(X_val_fold)
-                
-                for idx, pred in zip(val_idx, fold_predictions):
-                    predictions[idx].append(pred)
+                    pred = model_clone.predict(X_val_fold)
+            
+            predictions.append((val_idx, pred))
+        
+        # Reorganize predictions
+        all_predictions = np.zeros((cv, len(X)) + pred.shape[1:])
+        all_predictions[:] = np.nan
+        
+        for fold, (indices, preds) in enumerate(predictions):
+            all_predictions[fold, indices] = preds
         
         # Calculate statistics for each sample
         mean_predictions = []
+        std_predictions = []
         lower_bounds = []
         upper_bounds = []
-        std_predictions = []
         
-        for idx in range(len(X)):
-            if predictions[idx]:  # Has predictions from CV
-                preds = np.array(predictions[idx])
-                
+        for i in range(len(X)):
+            # Get non-nan predictions for this sample
+            sample_preds = all_predictions[:, i]
+            valid_preds = sample_preds[~np.isnan(sample_preds).any(axis=tuple(range(1, sample_preds.ndim)))]
+            
+            if len(valid_preds) > 0:
                 if self.task_type == 'regression':
-                    mean_predictions.append(np.mean(preds))
-                    std_predictions.append(np.std(preds))
+                    mean_predictions.append(np.mean(valid_preds))
+                    std_predictions.append(np.std(valid_preds))
                     
-                    # Confidence intervals
                     alpha = 1 - confidence_level
-                    lower_percentile = (alpha / 2) * 100
-                    upper_percentile = (1 - alpha / 2) * 100
-                    
-                    lower_bounds.append(np.percentile(preds, lower_percentile))
-                    upper_bounds.append(np.percentile(preds, upper_percentile))
+                    lower_bounds.append(np.percentile(valid_preds, (alpha/2) * 100))
+                    upper_bounds.append(np.percentile(valid_preds, (1 - alpha/2) * 100))
                 else:
-                    if len(preds.shape) > 1:  # Probability predictions
-                        mean_predictions.append(np.mean(preds, axis=0))
-                        std_predictions.append(np.std(preds, axis=0))
+                    if len(valid_preds.shape) > 1:  # Probability predictions
+                        mean_predictions.append(np.mean(valid_preds, axis=0))
+                        std_predictions.append(np.std(valid_preds, axis=0))
                     else:  # Class predictions
-                        mean_predictions.append(stats.mode(preds)[0][0])
+                        mean_predictions.append(stats.mode(valid_preds)[0][0])
                         std_predictions.append(np.nan)  # No std for class predictions
         
         self.cv_predictions = predictions
@@ -435,326 +1181,57 @@ class UncertaintyQuantifier:
         of the target distribution.
         
         Args:
-            models: Single quantile model or list of quantile models
+            models: Single model or dict/list of models for different quantiles
             X: Features to predict on
-            quantiles: List of quantiles that the models predict
+            quantiles: List of quantiles (should match the models)
             
         Returns:
             Dictionary with quantile predictions
         """
-        logger.info(f"Estimating uncertainty using quantile regression")
+        logger.info("Estimating uncertainty using quantile regression")
         
-        if not isinstance(models, list):
-            models = [models]
-        
-        if len(models) != len(quantiles):
-            raise ValueError("Number of models must match number of quantiles")
-        
-        quantile_predictions = {}
-        
-        for model, q in zip(models, quantiles):
-            predictions = model.predict(X)
-            quantile_predictions[f'q{int(q*100)}'] = predictions
-        
-        # Calculate prediction intervals
-        if len(quantiles) == 2 and quantiles[0] < 0.5 < quantiles[1]:
-            lower_key = f'q{int(quantiles[0]*100)}'
-            upper_key = f'q{int(quantiles[1]*100)}'
+        if isinstance(models, dict):
+            # Dictionary of models keyed by quantile
+            predictions = {}
+            for q, model in models.items():
+                predictions[f'quantile_{q}'] = model.predict(X)
             
-            # Median as point estimate (if available)
-            if 0.5 in quantiles:
-                median_idx = quantiles.index(0.5)
-                median_pred = models[median_idx].predict(X)
-            else:
-                # Use mean of bounds as estimate
-                median_pred = (quantile_predictions[lower_key] + quantile_predictions[upper_key]) / 2
+            # Add median if available
+            if 0.5 in models:
+                predictions['predictions'] = predictions['quantile_0.5']
             
-            interval_width = quantile_predictions[upper_key] - quantile_predictions[lower_key]
+            # Add bounds if standard quantiles available
+            if 'quantile_0.05' in predictions and 'quantile_0.95' in predictions:
+                predictions['lower_bound'] = predictions['quantile_0.05']
+                predictions['upper_bound'] = predictions['quantile_0.95']
+                
+        elif isinstance(models, list):
+            # List of models corresponding to quantiles
+            if len(models) != len(quantiles):
+                raise ValueError("Number of models must match number of quantiles")
             
-            return {
-                'predictions': median_pred,
-                'lower_bound': quantile_predictions[lower_key],
-                'upper_bound': quantile_predictions[upper_key],
-                'interval_width': interval_width,
-                'quantile_predictions': quantile_predictions
-            }
-        
-        return {'quantile_predictions': quantile_predictions}
-    
-    def residual_uncertainty(self,
-                           model: Any,
-                           X_train: pd.DataFrame,
-                           y_train: pd.Series,
-                           X_test: pd.DataFrame,
-                           method: str = 'empirical',
-                           confidence_level: float = 0.95) -> Dict[str, np.ndarray]:
-        """
-        Estimate uncertainty based on residual analysis.
-        
-        This method analyzes the residuals from training data to estimate
-        prediction intervals for new data.
-        
-        Args:
-            model: Fitted model
-            X_train: Training features
-            y_train: Training target
-            X_test: Test features
-            method: Method for residual analysis ('empirical' or 'normalized')
-            confidence_level: Confidence level for intervals
-            
-        Returns:
-            Dictionary with uncertainty estimates
-        """
-        logger.info(f"Estimating uncertainty using residual analysis ({method})")
-        
-        # Get training predictions and residuals
-        train_predictions = model.predict(X_train)
-        residuals = y_train - train_predictions
-        
-        # Get test predictions
-        test_predictions = model.predict(X_test)
-        
-        if method == 'empirical':
-            # Simple empirical percentiles
-            alpha = 1 - confidence_level
-            lower_percentile = (alpha / 2) * 100
-            upper_percentile = (1 - alpha / 2) * 100
-            
-            residual_lower = np.percentile(residuals, lower_percentile)
-            residual_upper = np.percentile(residuals, upper_percentile)
-            
-            lower_bound = test_predictions + residual_lower
-            upper_bound = test_predictions + residual_upper
-            
-            # Residual standard deviation
-            residual_std = np.std(residuals)
-            
-        elif method == 'normalized':
-            # Normalized residuals (assuming homoscedasticity)
-            residual_std = np.std(residuals)
-            
-            # Standard normal quantiles
-            z_score = stats.norm.ppf((1 + confidence_level) / 2)
-            
-            lower_bound = test_predictions - z_score * residual_std
-            upper_bound = test_predictions + z_score * residual_std
-            
+            predictions = {}
+            for i, (q, model) in enumerate(zip(quantiles, models)):
+                pred = model.predict(X)
+                predictions[f'quantile_{q}'] = pred
+                
+                if q == 0.5:
+                    predictions['predictions'] = pred
+                elif q == quantiles[0]:
+                    predictions['lower_bound'] = pred
+                elif q == quantiles[-1]:
+                    predictions['upper_bound'] = pred
         else:
-            raise ValueError(f"Unknown method: {method}")
+            # Single model - assume it can predict multiple quantiles
+            raise ValueError("Single model quantile prediction not implemented")
         
-        return {
-            'predictions': test_predictions,
-            'lower_bound': lower_bound,
-            'upper_bound': upper_bound,
-            'residual_std': residual_std,
-            'training_residuals': residuals
-        }
-    
-    def conformal_prediction(self,
-                           model: Any,
-                           X_train: pd.DataFrame,
-                           y_train: pd.Series,
-                           X_cal: pd.DataFrame,
-                           y_cal: pd.Series,
-                           X_test: pd.DataFrame,
-                           alpha: float = 0.1) -> Dict[str, np.ndarray]:
-        """
-        Conformal prediction for uncertainty quantification.
-        
-        This method provides prediction intervals with guaranteed coverage
-        under the assumption of exchangeability.
-        
-        Args:
-            model: Base model (already fitted)
-            X_train: Training features
-            y_train: Training target
-            X_cal: Calibration features
-            y_cal: Calibration target
-            X_test: Test features
-            alpha: Miscoverage rate (1 - confidence_level)
-            
-        Returns:
-            Dictionary with conformal prediction intervals
-        """
-        logger.info(f"Computing conformal prediction intervals with alpha={alpha}")
-        
-        # Get calibration scores (nonconformity scores)
-        cal_predictions = model.predict(X_cal)
-        cal_scores = np.abs(y_cal - cal_predictions)
-        
-        # Compute the quantile of calibration scores
-        n_cal = len(y_cal)
-        q_level = np.ceil((n_cal + 1) * (1 - alpha)) / n_cal
-        q_level = np.clip(q_level, 0, 1)
-        qhat = np.quantile(cal_scores, q_level)
-        
-        # Get test predictions
-        test_predictions = model.predict(X_test)
-        
-        # Construct prediction intervals
-        lower_bound = test_predictions - qhat
-        upper_bound = test_predictions + qhat
-        
-        return {
-            'predictions': test_predictions,
-            'lower_bound': lower_bound,
-            'upper_bound': upper_bound,
-            'interval_width': 2 * qhat,
-            'calibration_scores': cal_scores,
-            'qhat': qhat
-        }
-    
-    def heteroscedastic_uncertainty(self,
-                                  mean_model: Any,
-                                  variance_model: Any,
-                                  X: pd.DataFrame,
-                                  confidence_level: float = 0.95) -> Dict[str, np.ndarray]:
-        """
-        Estimate uncertainty for heteroscedastic regression.
-        
-        This method uses separate models for mean and variance prediction
-        to handle heteroscedastic noise.
-        
-        Args:
-            mean_model: Model predicting the mean
-            variance_model: Model predicting the variance
-            X: Features to predict on
-            confidence_level: Confidence level for intervals
-            
-        Returns:
-            Dictionary with uncertainty estimates
-        """
-        logger.info("Estimating heteroscedastic uncertainty")
-        
-        # Get mean predictions
-        mean_predictions = mean_model.predict(X)
-        
-        # Get variance predictions
-        variance_predictions = variance_model.predict(X)
-        
-        # Ensure positive variance
-        variance_predictions = np.maximum(variance_predictions, 1e-6)
-        
-        # Standard deviation
-        std_predictions = np.sqrt(variance_predictions)
-        
-        # Confidence intervals assuming normal distribution
-        z_score = stats.norm.ppf((1 + confidence_level) / 2)
-        
-        lower_bound = mean_predictions - z_score * std_predictions
-        upper_bound = mean_predictions + z_score * std_predictions
-        
-        return {
-            'predictions': mean_predictions,
-            'lower_bound': lower_bound,
-            'upper_bound': upper_bound,
-            'std': std_predictions,
-            'variance': variance_predictions,
-            'aleatoric_uncertainty': std_predictions  # Variance model captures aleatoric uncertainty
-        }
-    
-    def _process_classification_predictions(self,
-                                          predictions: np.ndarray,
-                                          confidence_level: float) -> Dict[str, np.ndarray]:
-        """
-        Helper method to process classification predictions.
-        
-        Args:
-            predictions: Array of predictions
-            confidence_level: Confidence level
-            
-        Returns:
-            Dictionary with processed predictions
-        """
-        if len(predictions.shape) == 3:  # Probability predictions
-            mean_probs = np.mean(predictions, axis=0)
-            std_probs = np.std(predictions, axis=0)
-            
-            # Class predictions
-            class_predictions = np.argmax(mean_probs, axis=1)
-            
-            # Entropy as uncertainty
-            entropy = -np.sum(mean_probs * np.log(mean_probs + 1e-10), axis=1)
-            
-            # Maximum probability as confidence
-            max_prob = np.max(mean_probs, axis=1)
-            
-            return {
-                'predictions': class_predictions,
-                'probabilities': mean_probs,
-                'std': std_probs,
-                'entropy': entropy,
-                'confidence': max_prob,
-                'all_predictions': predictions
-            }
-        else:  # Direct class predictions
-            mode_predictions = stats.mode(predictions, axis=0)[0].ravel()
-            
-            # Agreement rate as confidence
-            agreement_rate = np.sum(predictions == mode_predictions[np.newaxis, :], axis=0) / len(predictions)
-            
-            return {
-                'predictions': mode_predictions,
-                'confidence': agreement_rate,
-                'all_predictions': predictions
-            }
-    
-    def plot_uncertainty_intervals(self,
-                                 y_true: Optional[np.ndarray],
-                                 predictions: np.ndarray,
-                                 lower_bound: np.ndarray,
-                                 upper_bound: np.ndarray,
-                                 indices: Optional[np.ndarray] = None,
-                                 title: str = "Prediction Intervals",
-                                 figsize: Tuple[int, int] = (12, 6)):
-        """
-        Plot prediction intervals with uncertainty bounds.
-        
-        Args:
-            y_true: True values (optional)
-            predictions: Point predictions
-            lower_bound: Lower confidence bounds
-            upper_bound: Upper confidence bounds
-            indices: Indices to plot (None for all)
-            title: Plot title
-            figsize: Figure size
-        """
-        import matplotlib.pyplot as plt
-        
-        if indices is None:
-            indices = np.arange(len(predictions))
-        
-        plt.figure(figsize=figsize)
-        
-        # Plot predictions and intervals
-        plt.scatter(indices, predictions[indices], label='Predictions', alpha=0.6, s=30)
-        plt.fill_between(indices, lower_bound[indices], upper_bound[indices], 
-                        alpha=0.3, label='Prediction Interval')
-        
-        # Plot true values if provided
-        if y_true is not None:
-            plt.scatter(indices, y_true[indices], label='True Values', 
-                       alpha=0.6, s=30, marker='x')
-            
-            # Calculate coverage
-            coverage = np.mean((y_true >= lower_bound) & (y_true <= upper_bound))
-            plt.text(0.02, 0.98, f'Coverage: {coverage:.2%}', 
-                    transform=plt.gca().transAxes, verticalalignment='top')
-        
-        plt.xlabel('Sample Index')
-        plt.ylabel('Value')
-        plt.title(title)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        return plt.gcf()
+        return predictions
     
     def calculate_metrics(self,
-                         y_true: np.ndarray,
-                         predictions: np.ndarray,
-                         lower_bound: np.ndarray,
-                         upper_bound: np.ndarray) -> Dict[str, float]:
+                        y_true: np.ndarray,
+                        predictions: np.ndarray,
+                        lower_bound: np.ndarray,
+                        upper_bound: np.ndarray) -> Dict[str, float]:
         """
         Calculate uncertainty quantification metrics.
         
@@ -801,13 +1278,48 @@ class UncertaintyQuantifier:
             'rmse': rmse,
             'mae': mae
         }
+    
+    def _process_classification_predictions(self, 
+                                          predictions: np.ndarray,
+                                          confidence_level: float) -> Dict[str, np.ndarray]:
+        """Process classification predictions for uncertainty."""
+        if len(predictions.shape) == 3:  # Probability predictions
+            mean_probs = np.mean(predictions, axis=0)
+            std_probs = np.std(predictions, axis=0)
+            
+            # Class predictions
+            class_preds = np.argmax(mean_probs, axis=1)
+            
+            # Entropy as uncertainty
+            entropy = -np.sum(mean_probs * np.log(mean_probs + 1e-10), axis=1)
+            
+            # Maximum probability (confidence)
+            max_prob = np.max(mean_probs, axis=1)
+            
+            return {
+                'predictions': class_preds,
+                'probabilities': mean_probs,
+                'std': std_probs,
+                'entropy': entropy,
+                'confidence': max_prob,
+                'all_predictions': predictions
+            }
+        else:  # Direct class predictions
+            mode_preds = stats.mode(predictions, axis=0)[0].ravel()
+            
+            # Agreement as inverse of disagreement
+            agreement = np.mean(predictions == mode_preds[np.newaxis, :], axis=0)
+            
+            return {
+                'predictions': mode_preds,
+                'agreement': agreement,
+                'all_predictions': predictions
+            }
 
 
-# Example usage functions
+# Example usage functions remain the same
 def example_regression_uncertainty():
-    """
-    Example of using UncertaintyQuantifier for regression tasks.
-    """
+    """Example of using UncertaintyQuantifier for regression tasks."""
     from sklearn.datasets import make_regression
     from sklearn.model_selection import train_test_split
     from sklearn.ensemble import RandomForestRegressor
@@ -849,9 +1361,7 @@ def example_regression_uncertainty():
 
 
 def example_classification_uncertainty():
-    """
-    Example of using UncertaintyQuantifier for classification tasks.
-    """
+    """Example of using UncertaintyQuantifier for classification tasks."""
     from sklearn.datasets import make_classification
     from sklearn.model_selection import train_test_split
     from sklearn.ensemble import RandomForestClassifier

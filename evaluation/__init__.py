@@ -22,6 +22,7 @@ from .visualization import (
 )
 
 from .uncertainty import (
+    UncertaintyEstimator,
     UncertaintyQuantifier,
     BootstrapUncertainty,
     BayesianUncertainty,
@@ -57,6 +58,7 @@ __all__ = [
     'ConfusionMatrixPlotter',
     
     # Uncertainty
+    'UncertaintyEstimator',
     'UncertaintyQuantifier',
     'BootstrapUncertainty',
     'BayesianUncertainty',

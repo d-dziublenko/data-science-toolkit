@@ -5,13 +5,16 @@ Machine learning models and base classes for the Universal Data Science Toolkit.
 
 from .base import (
     BaseModel,
+    MetaModel,
     BaseRegressor,
     BaseClassifier,
     AutoML,
-    EnsembleModel
+    SimpleLinearModel
 )
 
 from .ensemble import (
+    EnsembleModel,
+    BaseEnsemble,
     VotingEnsemble,
     StackingEnsemble,
     BaggingEnsemble,
@@ -42,12 +45,15 @@ from .transformers import (
 __all__ = [
     # Base models
     'BaseModel',
+    'MetaModel',
     'BaseRegressor',
     'BaseClassifier',
     'AutoML',
-    'EnsembleModel',
+    'SimpleLinearModel',
     
     # Ensemble methods
+    'EnsembleModel',
+    'BaseEnsemble',
     'VotingEnsemble',
     'StackingEnsemble',
     'BaggingEnsemble',
