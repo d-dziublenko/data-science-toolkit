@@ -12,9 +12,9 @@ import warnings
 # TensorFlow/Keras imports
 try:
     import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers, Model
-    from tensorflow.keras.callbacks import (
+    import keras
+    from keras import layers, Model
+    from keras.callbacks import (
         EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
         TensorBoard, Callback
     )

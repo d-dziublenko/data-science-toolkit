@@ -149,8 +149,8 @@ create_virtual_environment() {
 generate_requirements_files() {
     print_info "Generating requirements files..."
     
-    # Create requirements.txt (core dependencies)
-    cat > requirements.txt << 'EOF'
+    # Create requirements-core.txt (core dependencies)
+    cat > requirements-core.txt << 'EOF'
 # Core Data Processing
 pandas>=1.3.0
 numpy>=1.21.0
@@ -158,6 +158,7 @@ scipy>=1.7.0
 
 # Machine Learning
 scikit-learn>=1.0.0
+sklearn-genetic-opt>=0.10.0
 xgboost>=1.5.0
 lightgbm>=3.3.0
 
@@ -180,7 +181,7 @@ EOF
     # Create requirements-full.txt (all optional dependencies)
     cat > requirements-full.txt << 'EOF'
 # Include all core requirements
--r requirements.txt
+-r requirements-core.txt
 
 # Deep Learning (optional)
 tensorflow>=2.8.0
@@ -193,9 +194,11 @@ imbalanced-learn>=0.9.0
 # Experiment Tracking
 mlflow>=1.25.0
 optuna>=2.10.0
+toml>=0.10.2
 
 # Model Interpretability
 shap>=0.40.0
+lime>=0.2.0.1
 
 # Data Quality
 evidently>=0.1.50
@@ -204,6 +207,7 @@ great-expectations>=0.15.0
 # Advanced Visualization
 plotly>=5.5.0
 altair>=4.2.0
+colorama>=0.4.6
 
 # Geospatial (optional)
 geopandas>=0.9.0
@@ -211,6 +215,12 @@ geopandas>=0.9.0
 # Additional File Formats
 h5py>=3.6.0
 xlrd>=2.0.0
+
+# Parallel/Distributed Computing
+dask[complete]>=2023.1.0
+distributed>=2023.1.0
+ray[default]>=2.0.0
+ray[tune]>=2.0.0 
 EOF
 
     # Create requirements-dev.txt (development dependencies)
@@ -250,7 +260,7 @@ install_dependencies() {
     
     case $install_type in
         "basic")
-            pip install -r requirements.txt
+            pip install -r requirements-core.txt
             ;;
         "full")
             pip install -r requirements-full.txt
@@ -280,7 +290,6 @@ create_project_structure() {
         "logs"
         "configs"
         "notebooks"
-        "tests"
         "docs"
     )
     
@@ -544,6 +553,7 @@ def main():
         ("mlflow", "MLflow"),
         ("optuna", "Optuna"),
         ("shap", "SHAP"),
+        ("lime", "LIME"),
         ("evidently", "Evidently")
     ]
     
@@ -634,7 +644,7 @@ main() {
         4)
             print_info "Skipping automatic installation."
             echo "You can manually install dependencies using:"
-            echo "  pip install -r requirements.txt"
+            echo "  pip install -r requirements-core.txt"
             ;;
         *)
             print_error "Invalid choice!"

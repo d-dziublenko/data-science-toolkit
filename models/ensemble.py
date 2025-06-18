@@ -1,106 +1,95 @@
 """
 models/ensemble.py
-Ensemble learning methods with enhanced functionality.
+Ensemble methods for combining multiple models.
 """
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional, Union, Any, Tuple, Callable
-from sklearn.ensemble import (
-    RandomForestRegressor, RandomForestClassifier,
-    ExtraTreesRegressor, ExtraTreesClassifier,
-    GradientBoostingRegressor, GradientBoostingClassifier,
-    HistGradientBoostingRegressor, HistGradientBoostingClassifier,
-    VotingRegressor, VotingClassifier,
-    StackingRegressor, StackingClassifier,
-    BaggingRegressor, BaggingClassifier
-)
-from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, cross_val_score
-from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin, clone
-from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
-from sklearn.preprocessing import LabelEncoder
-import xgboost as xgb
-import lightgbm as lgb
-import catboost as cb
-import logging
-from copy import deepcopy
-from abc import ABC, abstractmethod
+from typing import List, Union, Optional, Tuple, Any, Callable, Dict
 import warnings
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
+from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
+from sklearn.ensemble import (
+    VotingClassifier, VotingRegressor,
+    StackingClassifier, StackingRegressor,
+    BaggingClassifier, BaggingRegressor
+)
+from sklearn.model_selection import cross_val_predict, KFold, StratifiedKFold
+import logging
 
 logger = logging.getLogger(__name__)
 
 
-class BaseEnsemble(ABC, BaseEstimator):
-    """Abstract base class for ensemble methods."""
+class BaseEnsemble(BaseEstimator):
+    """
+    Base class for ensemble methods.
+    
+    Provides common functionality for all ensemble models.
+    """
     
     def __init__(self, base_estimators: List[BaseEstimator], task_type: str = 'auto'):
         """
-        Initialize base ensemble.
+        Initialize BaseEnsemble.
         
         Args:
             base_estimators: List of base estimators
-            task_type: Type of task ('regression', 'classification', 'auto')
+            task_type: Type of task ('regression', 'classification', or 'auto')
         """
         self.base_estimators = base_estimators
         self.task_type = task_type
-        self.fitted_estimators_ = None
         self.is_fitted_ = False
         
-    @abstractmethod
-    def fit(self, X, y, sample_weight=None):
-        """Fit the ensemble."""
-        pass
-    
-    @abstractmethod
-    def predict(self, X):
-        """Make predictions."""
-        pass
-    
-    def _validate_estimators(self):
-        """Validate that estimators are compatible."""
-        if not self.base_estimators:
-            raise ValueError("No base estimators provided")
-        
-        # Check if all estimators have required methods
-        for est in self.base_estimators:
-            if not hasattr(est, 'fit') or not hasattr(est, 'predict'):
-                raise ValueError(f"Estimator {est} must have fit and predict methods")
-    
     def _infer_task_type(self, y):
         """Infer task type from target variable."""
         if self.task_type == 'auto':
             # Check if target is continuous or discrete
-            unique_ratio = len(np.unique(y)) / len(y)
-            if unique_ratio < 0.05:  # Less than 5% unique values
+            unique_values = np.unique(y)
+            n_unique = len(unique_values)
+            
+            if n_unique == 2:
+                self.task_type = 'classification'
+            elif n_unique < 10 and n_unique < len(y) * 0.05:
                 self.task_type = 'classification'
             else:
                 self.task_type = 'regression'
-            logger.info(f"Inferred task type: {self.task_type}")
+                
+        logger.info(f"Task type: {self.task_type}")
+        
+    def _validate_estimators(self):
+        """Validate base estimators."""
+        if not self.base_estimators:
+            raise ValueError("No base estimators provided")
+            
+        for estimator in self.base_estimators:
+            if not hasattr(estimator, 'fit'):
+                raise TypeError(f"Estimator {estimator} must have a fit method")
 
 
 class VotingEnsemble(BaseEnsemble):
     """
     Voting ensemble for combining predictions.
     
-    This class implements both hard and soft voting for classification,
-    and averaging for regression tasks.
+    Supports both hard and soft voting for classification,
+    and averaging for regression.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  estimators: List[Tuple[str, BaseEstimator]],
-                 voting: str = 'auto',
+                 voting: str = 'soft',
                  weights: Optional[List[float]] = None,
                  task_type: str = 'auto',
-                 flatten_transform: bool = True):
+                 flatten_transform: bool = True,
+                 verbose: bool = False):
         """
         Initialize VotingEnsemble.
         
         Args:
             estimators: List of (name, estimator) tuples
-            voting: Voting type ('hard', 'soft', 'auto')
-            weights: Weights for each estimator
-            task_type: Type of task ('regression', 'classification', 'auto')
-            flatten_transform: Whether to flatten transform output
+            voting: Voting type ('hard' or 'soft' for classification)
+            weights: Sequence of weights for estimators
+            task_type: Type of task
+            flatten_transform: Affects shape of transform output
+            verbose: Enable verbose output
         """
         base_estimators = [est for _, est in estimators]
         super().__init__(base_estimators, task_type)
@@ -109,6 +98,7 @@ class VotingEnsemble(BaseEnsemble):
         self.voting = voting
         self.weights = weights
         self.flatten_transform = flatten_transform
+        self.verbose = verbose
         self.voting_model_ = None
         
     def fit(self, X, y, sample_weight=None):
@@ -127,42 +117,35 @@ class VotingEnsemble(BaseEnsemble):
         X, y = check_X_y(X, accept_sparse=['csc'])
         self._validate_estimators()
         
-        # Infer task type if needed
+        # Infer task type
         self._infer_task_type(y)
         
-        # Determine voting type
-        if self.voting == 'auto':
-            if self.task_type == 'regression':
-                self.voting = 'soft'  # Averaging for regression
-            else:
-                # Check if all classifiers support predict_proba
-                all_support_proba = all(hasattr(est, 'predict_proba') 
-                                      for _, est in self.estimators)
-                self.voting = 'soft' if all_support_proba else 'hard'
-        
-        # Create sklearn voting model
+        # Create appropriate voting model
         if self.task_type == 'regression':
             self.voting_model_ = VotingRegressor(
                 estimators=self.estimators,
-                weights=self.weights
+                weights=self.weights,
+                verbose=self.verbose
             )
         else:
             self.voting_model_ = VotingClassifier(
                 estimators=self.estimators,
                 voting=self.voting,
                 weights=self.weights,
-                flatten_transform=self.flatten_transform
+                flatten_transform=self.flatten_transform,
+                verbose=self.verbose
             )
         
         # Fit the voting model
-        self.voting_model_.fit(X, y, sample_weight=sample_weight)
-        self.is_fitted_ = True
+        logger.info(f"Fitting voting ensemble with {len(self.estimators)} estimators")
+        self.voting_model_.fit(X, y, sample_weight)
         
+        self.is_fitted_ = True
         return self
     
     def predict(self, X):
         """
-        Make predictions using voting.
+        Make predictions.
         
         Args:
             X: Features to predict
@@ -274,30 +257,7 @@ class StackingEnsemble(BaseEnsemble):
         # Infer task type
         self._infer_task_type(y)
         
-        # Set default final estimator if not provided
-        if self.final_estimator is None:
-            if self.task_type == 'regression':
-                from sklearn.linear_model import RidgeCV
-                self.final_estimator = RidgeCV()
-            else:
-                from sklearn.linear_model import LogisticRegression
-                self.final_estimator = LogisticRegression(random_state=42)
-        
-        # Determine stack method
-        if self.stack_method == 'auto':
-            if self.task_type == 'regression':
-                self.stack_method = 'predict'
-            else:
-                # Check if all support predict_proba
-                methods = []
-                for name, est in self.estimators:
-                    if hasattr(est, 'predict_proba'):
-                        methods.append('predict_proba')
-                    else:
-                        methods.append('predict')
-                self.stack_method = methods
-        
-        # Create sklearn stacking model
+        # Create appropriate stacking model
         if self.task_type == 'regression':
             self.stacking_model_ = StackingRegressor(
                 estimators=self.estimators,
@@ -316,20 +276,37 @@ class StackingEnsemble(BaseEnsemble):
                 verbose=self.verbose
             )
         
-        # Fit the model
-        self.stacking_model_.fit(X, y, sample_weight=sample_weight)
-        self.is_fitted_ = True
+        # Fit the stacking model
+        logger.info(f"Fitting stacking ensemble with {len(self.estimators)} base estimators")
+        self.stacking_model_.fit(X, y, sample_weight)
         
+        self.is_fitted_ = True
         return self
     
     def predict(self, X):
-        """Make predictions."""
+        """
+        Make predictions.
+        
+        Args:
+            X: Features to predict
+            
+        Returns:
+            Predictions
+        """
         check_is_fitted(self, 'stacking_model_')
         X = check_array(X, accept_sparse=['csc'])
         return self.stacking_model_.predict(X)
     
     def predict_proba(self, X):
-        """Predict class probabilities."""
+        """
+        Predict class probabilities (classification only).
+        
+        Args:
+            X: Features to predict
+            
+        Returns:
+            Class probabilities
+        """
         if self.task_type != 'classification':
             raise AttributeError("predict_proba is only available for classification")
         
@@ -338,12 +315,20 @@ class StackingEnsemble(BaseEnsemble):
         return self.stacking_model_.predict_proba(X)
     
     def transform(self, X):
-        """Transform X using base estimators."""
+        """
+        Transform features using base estimators.
+        
+        Args:
+            X: Features to transform
+            
+        Returns:
+            Meta-features from base estimators
+        """
         check_is_fitted(self, 'stacking_model_')
         return self.stacking_model_.transform(X)
     
     @property
-    def fitted_estimators_(self):
+    def estimators_(self):
         """Get fitted base estimators."""
         if hasattr(self.stacking_model_, 'estimators_'):
             return self.stacking_model_.estimators_
@@ -359,14 +344,13 @@ class StackingEnsemble(BaseEnsemble):
 
 class BaggingEnsemble(BaseEnsemble):
     """
-    Bagging ensemble with enhanced functionality.
+    Bagging ensemble with bootstrap aggregation.
     
-    This class extends sklearn's bagging with additional features
-    like out-of-bag prediction and feature importance aggregation.
+    This class implements bagging for both classification and regression.
     """
     
     def __init__(self,
-                 base_estimator: BaseEstimator = None,
+                 base_estimator: Optional[BaseEstimator] = None,
                  n_estimators: int = 10,
                  max_samples: Union[int, float] = 1.0,
                  max_features: Union[int, float] = 1.0,
@@ -374,25 +358,23 @@ class BaggingEnsemble(BaseEnsemble):
                  bootstrap_features: bool = False,
                  oob_score: bool = False,
                  warm_start: bool = False,
-                 n_jobs: Optional[int] = None,
-                 random_state: Optional[int] = None,
                  task_type: str = 'auto',
+                 random_state: Optional[int] = None,
                  verbose: int = 0):
         """
         Initialize BaggingEnsemble.
         
         Args:
-            base_estimator: Base estimator to use
+            base_estimator: Base estimator to fit on subsets
             n_estimators: Number of base estimators
             max_samples: Number of samples to draw
             max_features: Number of features to draw
             bootstrap: Whether to bootstrap samples
             bootstrap_features: Whether to bootstrap features
-            oob_score: Whether to use out-of-bag samples for evaluation
+            oob_score: Whether to use out-of-bag samples
             warm_start: Whether to reuse previous solution
-            n_jobs: Number of parallel jobs
-            random_state: Random state
             task_type: Type of task
+            random_state: Random state
             verbose: Verbosity level
         """
         super().__init__([base_estimator] if base_estimator else [], task_type)
@@ -405,7 +387,6 @@ class BaggingEnsemble(BaseEnsemble):
         self.bootstrap_features = bootstrap_features
         self.oob_score = oob_score
         self.warm_start = warm_start
-        self.n_jobs = n_jobs
         self.random_state = random_state
         self.verbose = verbose
         self.bagging_model_ = None
@@ -428,16 +409,7 @@ class BaggingEnsemble(BaseEnsemble):
         # Infer task type
         self._infer_task_type(y)
         
-        # Set default base estimator if not provided
-        if self.base_estimator is None:
-            if self.task_type == 'regression':
-                from sklearn.tree import DecisionTreeRegressor
-                self.base_estimator = DecisionTreeRegressor(random_state=self.random_state)
-            else:
-                from sklearn.tree import DecisionTreeClassifier
-                self.base_estimator = DecisionTreeClassifier(random_state=self.random_state)
-        
-        # Create sklearn bagging model
+        # Create appropriate bagging model
         if self.task_type == 'regression':
             self.bagging_model_ = BaggingRegressor(
                 base_estimator=self.base_estimator,
@@ -448,7 +420,6 @@ class BaggingEnsemble(BaseEnsemble):
                 bootstrap_features=self.bootstrap_features,
                 oob_score=self.oob_score,
                 warm_start=self.warm_start,
-                n_jobs=self.n_jobs,
                 random_state=self.random_state,
                 verbose=self.verbose
             )
@@ -462,25 +433,41 @@ class BaggingEnsemble(BaseEnsemble):
                 bootstrap_features=self.bootstrap_features,
                 oob_score=self.oob_score,
                 warm_start=self.warm_start,
-                n_jobs=self.n_jobs,
                 random_state=self.random_state,
                 verbose=self.verbose
             )
         
-        # Fit the model
-        self.bagging_model_.fit(X, y, sample_weight=sample_weight)
-        self.is_fitted_ = True
+        # Fit the bagging model
+        logger.info(f"Fitting bagging ensemble with {self.n_estimators} estimators")
+        self.bagging_model_.fit(X, y, sample_weight)
         
+        self.is_fitted_ = True
         return self
     
     def predict(self, X):
-        """Make predictions."""
+        """
+        Make predictions.
+        
+        Args:
+            X: Features to predict
+            
+        Returns:
+            Predictions
+        """
         check_is_fitted(self, 'bagging_model_')
         X = check_array(X, accept_sparse=['csc'])
         return self.bagging_model_.predict(X)
     
     def predict_proba(self, X):
-        """Predict class probabilities."""
+        """
+        Predict class probabilities (classification only).
+        
+        Args:
+            X: Features to predict
+            
+        Returns:
+            Class probabilities
+        """
         if self.task_type != 'classification':
             raise AttributeError("predict_proba is only available for classification")
         
@@ -523,10 +510,13 @@ class BaggingEnsemble(BaseEnsemble):
             return self.bagging_model_.oob_prediction_
         return None
     
-    def get_feature_importance(self):
+    def get_feature_importance(self, X):
         """
         Get aggregated feature importance from all estimators.
         
+        Args:
+            X: Features (needed for shape)
+            
         Returns:
             Array of feature importances
         """
@@ -545,6 +535,271 @@ class BaggingEnsemble(BaseEnsemble):
         
         # Return mean importance
         return np.mean(importances, axis=0)
+
+
+class ModelStacker:
+    """
+    Advanced stacking implementation.
+    
+    Combines multiple models using meta-learning for improved performance.
+    """
+    
+    def __init__(self,
+                 base_models: List[Tuple[str, Any]],
+                 meta_model: Optional[Any] = None,
+                 task_type: str = 'regression',
+                 cv: int = 5,
+                 use_probabilities: bool = True,
+                 cv_folds: Optional[Any] = None,
+                 stack_method: str = 'predict_proba'):
+        """
+        Initialize the ModelStacker.
+        
+        Args:
+            base_models: List of (name, model) tuples for base models
+            meta_model: Meta-learner model (default: LinearRegression/LogisticRegression)
+            task_type: Type of ML task ('regression' or 'classification')
+            cv: Number of cross-validation folds for stacking
+            use_probabilities: Whether to use probabilities for classification
+            cv_folds: Custom CV splitter
+            stack_method: Method for stacking ('predict_proba' or 'predict')
+        """
+        self.base_models = base_models
+        self.meta_model = meta_model
+        self.task_type = task_type
+        self.cv = cv
+        self.use_probabilities = use_probabilities
+        self.cv_folds = cv_folds
+        self.stack_method = stack_method
+        self.stacking_model = None
+        self.is_fitted = False
+    
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], 
+            y: Union[pd.Series, np.ndarray],
+            parallel: Optional[Any] = None):
+        """
+        Fit the stacking model.
+        
+        Args:
+            X: Feature matrix
+            y: Target variable
+            parallel: Optional parallel processor
+        """
+        if self.meta_model is None:
+            if self.task_type == 'regression':
+                from sklearn.linear_model import LinearRegression
+                self.meta_model = LinearRegression()
+            else:
+                from sklearn.linear_model import LogisticRegression
+                self.meta_model = LogisticRegression(random_state=42)
+        
+        # Set up CV strategy if not provided
+        if self.cv_folds is None:
+            self.cv_folds = self.cv
+        
+        # Determine stack method for classification
+        if self.task_type == 'classification' and self.use_probabilities:
+            stack_method = 'predict_proba'
+        else:
+            stack_method = 'predict'
+        
+        if self.task_type == 'regression':
+            self.stacking_model = StackingRegressor(
+                estimators=self.base_models,
+                final_estimator=self.meta_model,
+                cv=self.cv_folds
+            )
+        else:
+            self.stacking_model = StackingClassifier(
+                estimators=self.base_models,
+                final_estimator=self.meta_model,
+                cv=self.cv_folds,
+                stack_method=stack_method
+            )
+        
+        logger.info(f"Training stacking model with {len(self.base_models)} base models")
+        self.stacking_model.fit(X, y)
+        self.is_fitted = True
+    
+    def predict(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        """Make predictions using the stacking model."""
+        if not self.is_fitted or self.stacking_model is None:
+            raise ValueError("Model has not been fitted yet")
+        return self.stacking_model.predict(X)
+    
+    def predict_proba(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        """Make probability predictions (classification only)."""
+        if self.task_type != 'classification':
+            raise ValueError("predict_proba is only available for classification")
+        if not self.is_fitted or self.stacking_model is None:
+            raise ValueError("Model has not been fitted yet")
+        return self.stacking_model.predict_proba(X)
+    
+    def get_base_predictions(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
+        """Get predictions from all base models."""
+        if not self.is_fitted or self.stacking_model is None:
+            raise ValueError("Model has not been fitted yet")
+        
+        predictions = {}
+        for name, estimator in self.stacking_model.estimators_:
+            predictions[name] = estimator.predict(X)
+        
+        return pd.DataFrame(predictions)
+
+
+class ModelBlender:
+    """
+    Simple model blending implementation.
+    
+    Combines predictions from multiple models using weighted averaging.
+    """
+    
+    def __init__(self, 
+                 models: List[Tuple[str, Any]], 
+                 weights: Optional[List[float]] = None,
+                 blend_method: str = 'weighted',
+                 optimization_metric: str = 'rmse'):
+        """
+        Initialize the ModelBlender.
+        
+        Args:
+            models: List of (name, model) tuples
+            weights: Weights for each model (default: equal weights)
+            blend_method: Method for blending ('weighted', 'mean', 'ranked')
+            optimization_metric: Metric to optimize when finding weights
+        """
+        self.models = models
+        self.weights = weights
+        self.blend_method = blend_method
+        self.optimization_metric = optimization_metric
+        self.fitted_models = []
+        self.optimized_weights = None
+        self.is_fitted = False
+        
+        if weights is not None:
+            if len(weights) != len(models):
+                raise ValueError("Number of weights must match number of models")
+            
+            # Normalize weights
+            total_weight = sum(weights)
+            self.weights = [w / total_weight for w in weights]
+    
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray]):
+        """
+        Fit all models in the blend.
+        
+        Args:
+            X: Feature matrix
+            y: Target variable
+        """
+        logger.info(f"Training {len(self.models)} models for blending")
+        
+        self.fitted_models = []
+        for name, model in self.models:
+            logger.info(f"Training {name}")
+            fitted_model = clone(model)
+            fitted_model.fit(X, y)
+            self.fitted_models.append((name, fitted_model))
+        
+        # Initialize equal weights if not provided
+        if self.weights is None:
+            self.weights = [1.0 / len(self.models)] * len(self.models)
+        
+        self.optimized_weights = self.weights
+        self.is_fitted = True
+    
+    def predict(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        """
+        Make blended predictions.
+        
+        Args:
+            X: Feature matrix
+            
+        Returns:
+            Weighted average of all model predictions
+        """
+        if not self.is_fitted:
+            raise ValueError("Model has not been fitted yet")
+            
+        predictions = []
+        
+        for (name, model), weight in zip(self.fitted_models, self.optimized_weights):
+            pred = model.predict(X) * weight
+            predictions.append(pred)
+        
+        return np.sum(predictions, axis=0)
+    
+    def optimize_weights(self, X_val: Union[pd.DataFrame, np.ndarray], 
+                        y_val: Union[pd.Series, np.ndarray],
+                        metric: Optional[str] = None):
+        """
+        Optimize blending weights using validation data.
+        
+        Args:
+            X_val: Validation features
+            y_val: Validation targets
+            metric: Optimization metric (uses self.optimization_metric if None)
+        """
+        if not self.is_fitted:
+            raise ValueError("Models must be fitted before optimizing weights")
+            
+        from scipy.optimize import minimize
+        
+        metric = metric or self.optimization_metric
+        
+        # Get predictions from all models
+        val_predictions = []
+        for name, model in self.fitted_models:
+            pred = model.predict(X_val)
+            val_predictions.append(pred)
+        
+        val_predictions = np.array(val_predictions).T
+        
+        def objective(weights):
+            """Objective function to minimize."""
+            # Ensure weights sum to 1
+            weights = weights / weights.sum()
+            
+            # Calculate weighted predictions
+            weighted_pred = val_predictions @ weights
+            
+            # Calculate metric
+            if metric == 'rmse':
+                return np.sqrt(np.mean((y_val - weighted_pred) ** 2))
+            elif metric == 'mae':
+                return np.mean(np.abs(y_val - weighted_pred))
+            elif metric == 'mse':
+                return np.mean((y_val - weighted_pred) ** 2)
+            else:
+                raise ValueError(f"Unknown metric: {metric}")
+        
+        # Initial weights
+        x0 = np.array([1.0 / len(self.models)] * len(self.models))
+        
+        # Constraints: weights sum to 1
+        constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}
+        
+        # Bounds: weights between 0 and 1
+        bounds = [(0, 1)] * len(self.models)
+        
+        # Optimize
+        result = minimize(objective, x0, method='SLSQP', 
+                         bounds=bounds, constraints=constraints)
+        
+        if result.success:
+            self.optimized_weights = result.x / result.x.sum()
+            logger.info(f"Optimized weights: {self.optimized_weights}")
+        else:
+            logger.warning("Weight optimization failed, using equal weights")
+            self.optimized_weights = self.weights
+    
+    def get_model_weights(self) -> Dict[str, float]:
+        """Get the weights for each model."""
+        if not self.is_fitted:
+            raise ValueError("Model has not been fitted yet")
+            
+        return {name: weight for (name, _), weight 
+                in zip(self.models, self.optimized_weights)}
 
 
 class WeightedEnsemble(BaseEnsemble):
@@ -627,7 +882,7 @@ class WeightedEnsemble(BaseEnsemble):
         else:
             # Normalize provided weights
             total_weight = sum(self.weights)
-            self.optimized_weights_ = [w / total_weight for w in self.weights]
+            self.optimized_weights_ = np.array([w / total_weight for w in self.weights])
         
         self.is_fitted_ = True
         return self
@@ -646,11 +901,15 @@ class WeightedEnsemble(BaseEnsemble):
         logger.info("Optimizing ensemble weights")
         
         # Get CV predictions
-        kf = KFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
+        if self.task_type == 'classification':
+            kf = StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
+        else:
+            kf = KFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
+            
         cv_predictions = {name: [] for name, _ in self.estimators}
         y_true_cv = []
         
-        for train_idx, val_idx in kf.split(X):
+        for train_idx, val_idx in kf.split(X, y):
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
             y_true_cv.extend(y_val)
@@ -669,12 +928,32 @@ class WeightedEnsemble(BaseEnsemble):
                     else:
                         pred = est_clone.predict(X_val)
                 
-                cv_predictions[name].extend(pred)
+                cv_predictions[name].append(pred)
+        
+        # Concatenate predictions
+        for name in cv_predictions:
+            cv_predictions[name] = np.concatenate(cv_predictions[name])
         
         # Convert to arrays
         y_true_cv = np.array(y_true_cv)
-        prediction_matrix = np.column_stack([np.array(cv_predictions[name]) 
-                                           for name, _ in self.estimators])
+        
+        # Stack predictions
+        if self.task_type == 'regression':
+            prediction_matrix = np.column_stack([cv_predictions[name] 
+                                               for name, _ in self.estimators])
+        else:
+            # For classification, handle probability matrices
+            first_pred = list(cv_predictions.values())[0]
+            if len(first_pred.shape) > 1:
+                # Probabilities - stack them
+                prediction_list = []
+                for name, _ in self.estimators:
+                    prediction_list.append(cv_predictions[name])
+                prediction_matrix = np.stack(prediction_list, axis=0)
+            else:
+                # Hard predictions
+                prediction_matrix = np.column_stack([cv_predictions[name] 
+                                                   for name, _ in self.estimators])
         
         # Define objective function
         def objective(weights):
@@ -692,38 +971,50 @@ class WeightedEnsemble(BaseEnsemble):
                     # Weighted average of probabilities
                     weighted_pred = np.sum(prediction_matrix * weights[:, None, None], axis=0)
                     # Cross-entropy loss
-                    from sklearn.preprocessing import LabelBinarizer
-                    lb = LabelBinarizer()
-                    y_true_binary = lb.fit_transform(y_true_cv)
-                    epsilon = 1e-10
-                    weighted_pred = np.clip(weighted_pred, epsilon, 1 - epsilon)
+                    eps = 1e-15
+                    weighted_pred = np.clip(weighted_pred, eps, 1 - eps)
+                    # Convert y_true to one-hot if needed
+                    if len(y_true_cv.shape) == 1:
+                        from sklearn.preprocessing import LabelBinarizer
+                        lb = LabelBinarizer()
+                        y_true_binary = lb.fit_transform(y_true_cv)
+                        if y_true_binary.shape[1] == 1:
+                            # Binary case
+                            y_true_binary = np.hstack([1 - y_true_binary, y_true_binary])
+                    else:
+                        y_true_binary = y_true_cv
+                    
+                    # Calculate cross-entropy
                     return -np.mean(y_true_binary * np.log(weighted_pred))
                 else:
                     # Hard predictions - use accuracy
-                    weighted_pred = np.round(prediction_matrix @ weights)
-                    return np.mean(weighted_pred != y_true_cv)
+                    weighted_pred = prediction_matrix @ weights
+                    weighted_pred = np.round(weighted_pred).astype(int)
+                    return -np.mean(weighted_pred == y_true_cv)
         
-        # Initial weights (equal)
-        initial_weights = np.ones(len(self.estimators)) / len(self.estimators)
+        # Initial weights
+        x0 = np.array([1.0 / len(self.estimators)] * len(self.estimators))
         
-        # Constraints: weights sum to 1, all weights >= 0
-        constraints = {'type': 'eq', 'fun': lambda w: w.sum() - 1}
-        bounds = [(0, 1) for _ in self.estimators]
+        # Constraints: weights sum to 1
+        constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}
+        
+        # Bounds: weights between 0 and 1
+        bounds = [(0, 1)] * len(self.estimators)
         
         # Optimize
-        result = minimize(objective, initial_weights, method='SLSQP',
+        result = minimize(objective, x0, method='SLSQP', 
                          bounds=bounds, constraints=constraints)
         
-        self.optimized_weights_ = result.x
-        
-        # Log optimized weights
-        weight_dict = {name: weight for (name, _), weight 
-                      in zip(self.estimators, self.optimized_weights_)}
-        logger.info(f"Optimized weights: {weight_dict}")
+        if result.success:
+            self.optimized_weights_ = result.x / result.x.sum()
+            logger.info(f"Optimized weights: {self.optimized_weights_}")
+        else:
+            logger.warning("Weight optimization failed, using equal weights")
+            self.optimized_weights_ = np.array([1.0 / len(self.estimators)] * len(self.estimators))
     
     def predict(self, X):
         """
-        Make weighted predictions.
+        Make predictions.
         
         Args:
             X: Features to predict
@@ -736,23 +1027,17 @@ class WeightedEnsemble(BaseEnsemble):
         
         # Get predictions from all estimators
         predictions = []
-        for name, estimator in self.fitted_estimators_:
-            pred = estimator.predict(X)
+        
+        for (name, estimator), weight in zip(self.fitted_estimators_, self.optimized_weights_):
+            pred = estimator.predict(X) * weight
             predictions.append(pred)
         
-        # Apply weights
-        predictions = np.array(predictions)
-        weighted_pred = np.sum(predictions * self.optimized_weights_[:, np.newaxis], axis=0)
-        
-        # For classification, round to nearest integer
-        if self.task_type == 'classification':
-            weighted_pred = np.round(weighted_pred).astype(int)
-        
-        return weighted_pred
+        # Sum weighted predictions
+        return np.sum(predictions, axis=0)
     
     def predict_proba(self, X):
         """
-        Predict class probabilities using weighted average.
+        Predict class probabilities (classification only).
         
         Args:
             X: Features to predict
@@ -778,7 +1063,8 @@ class WeightedEnsemble(BaseEnsemble):
                 pred = estimator.predict(X)
                 n_classes = len(np.unique(pred))
                 proba = np.zeros((len(X), n_classes))
-                proba[np.arange(len(X)), pred] = 1.0
+                for i, p in enumerate(pred):
+                    proba[i, int(p)] = 1.0
                 proba_predictions.append(proba)
         
         # Apply weights
@@ -829,34 +1115,160 @@ class EnsembleModel:
         self.best_params = None
         self.feature_importances_ = None
         self.model_scores = {}
+        self.is_fitted = False
     
     def _get_model_class(self, model_type: str):
         """Get the appropriate model class based on task and model type."""
         model_mapping = {
             'regression': {
-                'rf': RandomForestRegressor,
-                'et': ExtraTreesRegressor,
-                'gb': GradientBoostingRegressor,
-                'hgb': HistGradientBoostingRegressor,
-                'xgb': xgb.XGBRegressor,
-                'lgb': lgb.LGBMRegressor,
-                'cat': cb.CatBoostRegressor
+                'rf': 'RandomForestRegressor',
+                'et': 'ExtraTreesRegressor',
+                'gb': 'GradientBoostingRegressor',
+                'xgb': 'XGBRegressor',
+                'lgb': 'LGBMRegressor',
+                'cat': 'CatBoostRegressor'
             },
             'classification': {
-                'rf': RandomForestClassifier,
-                'et': ExtraTreesClassifier,
-                'gb': GradientBoostingClassifier,
-                'hgb': HistGradientBoostingClassifier,
-                'xgb': xgb.XGBClassifier,
-                'lgb': lgb.LGBMClassifier,
-                'cat': cb.CatBoostClassifier
+                'rf': 'RandomForestClassifier',
+                'et': 'ExtraTreesClassifier',
+                'gb': 'GradientBoostingClassifier',
+                'xgb': 'XGBClassifier',
+                'lgb': 'LGBMClassifier',
+                'cat': 'CatBoostClassifier'
             }
         }
         
-        return model_mapping[self.task_type][model_type]
+        try:
+            from sklearn.ensemble import (
+                RandomForestRegressor, RandomForestClassifier,
+                ExtraTreesRegressor, ExtraTreesClassifier,
+                GradientBoostingRegressor, GradientBoostingClassifier
+            )
+            
+            # Try importing optional libraries
+            try:
+                from xgboost import XGBRegressor, XGBClassifier
+            except ImportError:
+                logger.warning("XGBoost not installed")
+                
+            try:
+                from lightgbm import LGBMRegressor, LGBMClassifier
+            except ImportError:
+                logger.warning("LightGBM not installed")
+                
+            try:
+                from catboost import CatBoostRegressor, CatBoostClassifier
+            except ImportError:
+                logger.warning("CatBoost not installed")
+            
+            # Get the model class
+            model_name = model_mapping[self.task_type][model_type]
+            return eval(model_name)
+            
+        except Exception as e:
+            logger.error(f"Error loading model class: {e}")
+            # Fallback to RandomForest
+            if self.task_type == 'regression':
+                return RandomForestRegressor
+            else:
+                return RandomForestClassifier
     
-    def _get_param_grid(self, model_type: str) -> Dict:
-        """Get hyperparameter grid for the specified model type."""
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], 
+            y: Union[pd.Series, np.ndarray],
+            tune_hyperparameters: bool = False,
+            cv: int = 5,
+            scoring: Optional[str] = None,
+            n_iter: int = 50):
+        """
+        Fit the ensemble model.
+        
+        Args:
+            X: Training features
+            y: Training targets
+            tune_hyperparameters: Whether to tune hyperparameters
+            cv: Cross-validation folds
+            scoring: Scoring metric
+            n_iter: Number of iterations for random search
+            
+        Returns:
+            Self
+        """
+        # Auto-select model if needed
+        if self.model_type == 'auto':
+            self._auto_select_model(X, y, cv, scoring)
+        else:
+            ModelClass = self._get_model_class(self.model_type)
+            self.model = ModelClass(random_state=self.random_state)
+        
+        # Tune hyperparameters if requested
+        if tune_hyperparameters:
+            self._tune_hyperparameters(X, y, cv, scoring, n_iter)
+        else:
+            # Fit with default parameters
+            self.model.fit(X, y)
+        
+        # Extract feature importances if available
+        if hasattr(self.model, 'feature_importances_'):
+            self.feature_importances_ = self.model.feature_importances_
+        
+        self.is_fitted = True
+        return self
+    
+    def _auto_select_model(self, X, y, cv, scoring):
+        """Automatically select the best model type."""
+        logger.info("Auto-selecting best model type")
+        
+        candidate_models = ['rf', 'gb']  # Start with basic models
+        
+        # Add optional models if available
+        try:
+            import xgboost
+            candidate_models.append('xgb')
+        except ImportError:
+            pass
+            
+        try:
+            import lightgbm
+            candidate_models.append('lgb')
+        except ImportError:
+            pass
+        
+        best_score = -np.inf
+        best_model_type = 'rf'
+        
+        for model_type in candidate_models:
+            try:
+                ModelClass = self._get_model_class(model_type)
+                model = ModelClass(random_state=self.random_state)
+                
+                # Quick cross-validation
+                from sklearn.model_selection import cross_val_score
+                scores = cross_val_score(model, X, y, cv=min(cv, 3), scoring=scoring)
+                mean_score = np.mean(scores)
+                
+                logger.info(f"{model_type}: {mean_score:.4f}")
+                self.model_scores[model_type] = mean_score
+                
+                if mean_score > best_score:
+                    best_score = mean_score
+                    best_model_type = model_type
+                    
+            except Exception as e:
+                logger.warning(f"Failed to evaluate {model_type}: {e}")
+        
+        # Set the best model
+        self.model_type = best_model_type
+        ModelClass = self._get_model_class(best_model_type)
+        self.model = ModelClass(random_state=self.random_state)
+        logger.info(f"Selected model: {best_model_type}")
+    
+    def _tune_hyperparameters(self, X, y, cv, scoring, n_iter):
+        """Tune model hyperparameters."""
+        from sklearn.model_selection import RandomizedSearchCV
+        
+        logger.info("Tuning hyperparameters")
+        
+        # Define parameter grids for different models
         param_grids = {
             'rf': {
                 'n_estimators': [100, 200, 300],
@@ -864,143 +1276,53 @@ class EnsembleModel:
                 'min_samples_split': [2, 5, 10],
                 'min_samples_leaf': [1, 2, 4]
             },
-            'et': {
-                'n_estimators': [100, 200, 300],
-                'max_depth': [None, 10, 20, 30],
-                'min_samples_split': [2, 5, 10],
-                'min_samples_leaf': [1, 2, 4]
-            },
             'gb': {
                 'n_estimators': [100, 200, 300],
-                'learning_rate': [0.01, 0.1, 0.2],
+                'learning_rate': [0.01, 0.1, 0.3],
                 'max_depth': [3, 5, 7],
-                'min_samples_split': [2, 5, 10]
-            },
-            'hgb': {
-                'max_iter': [100, 200, 300],
-                'learning_rate': [0.01, 0.1, 0.2],
-                'max_depth': [None, 10, 20],
-                'min_samples_leaf': [20, 50, 100]
+                'subsample': [0.8, 0.9, 1.0]
             },
             'xgb': {
                 'n_estimators': [100, 200, 300],
-                'learning_rate': [0.01, 0.1, 0.2],
+                'learning_rate': [0.01, 0.1, 0.3],
                 'max_depth': [3, 5, 7],
-                'subsample': [0.8, 1.0],
-                'colsample_bytree': [0.8, 1.0]
+                'subsample': [0.8, 0.9, 1.0],
+                'colsample_bytree': [0.8, 0.9, 1.0]
             },
             'lgb': {
                 'n_estimators': [100, 200, 300],
-                'learning_rate': [0.01, 0.1, 0.2],
+                'learning_rate': [0.01, 0.1, 0.3],
                 'num_leaves': [31, 50, 100],
-                'min_child_samples': [20, 50, 100]
-            },
-            'cat': {
-                'iterations': [100, 200, 300],
-                'learning_rate': [0.01, 0.1, 0.2],
-                'depth': [4, 6, 8],
-                'l2_leaf_reg': [1, 3, 5]
+                'feature_fraction': [0.8, 0.9, 1.0],
+                'bagging_fraction': [0.8, 0.9, 1.0]
             }
         }
         
-        return param_grids.get(model_type, {})
-    
-    def fit(self, 
-            X: Union[pd.DataFrame, np.ndarray], 
-            y: Union[pd.Series, np.ndarray],
-            tune_hyperparameters: bool = True,
-            cv: int = 5,
-            scoring: Optional[str] = None,
-            n_iter: int = 20):
-        """
-        Fit the ensemble model with optional hyperparameter tuning.
+        # Get parameter grid for current model
+        model_key = self.model_type if self.model_type in param_grids else 'rf'
+        param_grid = param_grids[model_key]
         
-        Args:
-            X: Feature matrix
-            y: Target variable
-            tune_hyperparameters: Whether to perform hyperparameter tuning
-            cv: Number of cross-validation folds
-            scoring: Scoring metric for hyperparameter tuning
-            n_iter: Number of iterations for random search
-        """
-        if self.model_type == 'auto':
-            # Try multiple models and select the best
-            self._auto_select_model(X, y, cv, scoring)
-        else:
-            # Use specified model
-            model_class = self._get_model_class(self.model_type)
-            
-            if self.model_type == 'cat':
-                base_model = model_class(random_state=self.random_state, verbose=False)
-            else:
-                base_model = model_class(random_state=self.random_state)
-            
-            if tune_hyperparameters:
-                param_grid = self._get_param_grid(self.model_type)
-                if param_grid:
-                    logger.info(f"Tuning hyperparameters for {self.model_type}")
-                    
-                    # Use RandomizedSearchCV for faster tuning
-                    search = RandomizedSearchCV(
-                        base_model, param_grid, n_iter=n_iter,
-                        cv=cv, scoring=scoring, n_jobs=-1,
-                        random_state=self.random_state
-                    )
-                    search.fit(X, y)
-                    
-                    self.model = search.best_estimator_
-                    self.best_params = search.best_params_
-                    logger.info(f"Best parameters: {self.best_params}")
-                else:
-                    self.model = base_model
-                    self.model.fit(X, y)
-            else:
-                self.model = base_model
-                self.model.fit(X, y)
+        # Run random search
+        random_search = RandomizedSearchCV(
+            self.model,
+            param_distributions=param_grid,
+            n_iter=min(n_iter, 20),
+            cv=cv,
+            scoring=scoring,
+            random_state=self.random_state,
+            n_jobs=-1
+        )
         
-        # Extract feature importances if available
-        if hasattr(self.model, 'feature_importances_'):
-            self.feature_importances_ = self.model.feature_importances_
-    
-    def _auto_select_model(self, X, y, cv, scoring):
-        """Automatically select the best model based on cross-validation."""
-        model_types = ['rf', 'et', 'gb', 'xgb', 'lgb']
-        best_score = -np.inf
-        best_model_type = None
+        random_search.fit(X, y)
         
-        for model_type in model_types:
-            logger.info(f"Evaluating {model_type}")
-            
-            try:
-                model_class = self._get_model_class(model_type)
-                if model_type == 'cat':
-                    model = model_class(random_state=self.random_state, verbose=False)
-                else:
-                    model = model_class(random_state=self.random_state)
-                
-                # Quick evaluation with cross-validation
-                scores = cross_val_score(model, X, y, cv=cv, scoring=scoring)
-                mean_score = np.mean(scores)
-                
-                self.model_scores[model_type] = mean_score
-                logger.info(f"{model_type} CV score: {mean_score:.4f}")
-                
-                if mean_score > best_score:
-                    best_score = mean_score
-                    best_model_type = model_type
-            
-            except Exception as e:
-                logger.warning(f"Failed to evaluate {model_type}: {e}")
-        
-        logger.info(f"Best model: {best_model_type} (score: {best_score:.4f})")
-        
-        # Train the best model with hyperparameter tuning
-        self.model_type = best_model_type
-        self.fit(X, y, tune_hyperparameters=True, cv=cv, scoring=scoring)
+        # Update model with best parameters
+        self.model = random_search.best_estimator_
+        self.best_params = random_search.best_params_
+        logger.info(f"Best parameters: {self.best_params}")
     
     def predict(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
-        """Make predictions using the fitted model."""
-        if self.model is None:
+        """Make predictions."""
+        if not self.is_fitted:
             raise ValueError("Model has not been fitted yet")
         return self.model.predict(X)
     
@@ -1008,281 +1330,49 @@ class EnsembleModel:
         """Make probability predictions (classification only)."""
         if self.task_type != 'classification':
             raise ValueError("predict_proba is only available for classification")
-        if self.model is None:
+        if not self.is_fitted:
             raise ValueError("Model has not been fitted yet")
         return self.model.predict_proba(X)
-
-
-class ModelStacker:
-    """
-    Advanced model stacking implementation.
     
-    Combines multiple models using meta-learning for improved performance.
-    """
-    
-    def __init__(self,
-                 base_models: List[Tuple[str, Any]],
-                 meta_model: Optional[Any] = None,
-                 task_type: str = 'regression',
-                 cv: int = 5):
-        """
-        Initialize the ModelStacker.
-        
-        Args:
-            base_models: List of (name, model) tuples for base models
-            meta_model: Meta-learner model (default: LinearRegression/LogisticRegression)
-            task_type: Type of ML task ('regression' or 'classification')
-            cv: Number of cross-validation folds for stacking
-        """
-        self.base_models = base_models
-        self.meta_model = meta_model
-        self.task_type = task_type
-        self.cv = cv
-        self.stacking_model = None
-    
-    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray]):
-        """
-        Fit the stacking model.
-        
-        Args:
-            X: Feature matrix
-            y: Target variable
-        """
-        if self.meta_model is None:
-            if self.task_type == 'regression':
-                from sklearn.linear_model import LinearRegression
-                self.meta_model = LinearRegression()
-            else:
-                from sklearn.linear_model import LogisticRegression
-                self.meta_model = LogisticRegression(random_state=42)
-        
-        if self.task_type == 'regression':
-            self.stacking_model = StackingRegressor(
-                estimators=self.base_models,
-                final_estimator=self.meta_model,
-                cv=self.cv
-            )
-        else:
-            self.stacking_model = StackingClassifier(
-                estimators=self.base_models,
-                final_estimator=self.meta_model,
-                cv=self.cv
-            )
-        
-        logger.info(f"Training stacking model with {len(self.base_models)} base models")
-        self.stacking_model.fit(X, y)
-    
-    def predict(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
-        """Make predictions using the stacking model."""
-        if self.stacking_model is None:
+    def get_feature_importance(self) -> np.ndarray:
+        """Get feature importances."""
+        if not self.is_fitted:
             raise ValueError("Model has not been fitted yet")
-        return self.stacking_model.predict(X)
-    
-    def get_base_predictions(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
-        """Get predictions from all base models."""
-        if self.stacking_model is None:
-            raise ValueError("Model has not been fitted yet")
-        
-        predictions = {}
-        for name, estimator in self.stacking_model.estimators_:
-            predictions[name] = estimator.predict(X)
-        
-        return pd.DataFrame(predictions)
+        if self.feature_importances_ is None:
+            raise ValueError("Model does not support feature importances")
+        return self.feature_importances_
 
 
-class ModelBlender:
-    """
-    Simple model blending implementation.
-    
-    Combines predictions from multiple models using weighted averaging.
-    """
-    
-    def __init__(self, models: List[Tuple[str, Any]], weights: Optional[List[float]] = None):
-        """
-        Initialize the ModelBlender.
-        
-        Args:
-            models: List of (name, model) tuples
-            weights: Weights for each model (default: equal weights)
-        """
-        self.models = models
-        self.weights = weights or [1.0 / len(models)] * len(models)
-        
-        if len(self.weights) != len(self.models):
-            raise ValueError("Number of weights must match number of models")
-        
-        # Normalize weights
-        total_weight = sum(self.weights)
-        self.weights = [w / total_weight for w in self.weights]
-    
-    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray]):
-        """
-        Fit all models in the blend.
-        
-        Args:
-            X: Feature matrix
-            y: Target variable
-        """
-        logger.info(f"Training {len(self.models)} models for blending")
-        
-        for name, model in self.models:
-            logger.info(f"Training {name}")
-            model.fit(X, y)
-    
-    def predict(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
-        """
-        Make blended predictions.
-        
-        Args:
-            X: Feature matrix
-            
-        Returns:
-            Weighted average of all model predictions
-        """
-        predictions = []
-        
-        for (name, model), weight in zip(self.models, self.weights):
-            pred = model.predict(X) * weight
-            predictions.append(pred)
-        
-        return np.sum(predictions, axis=0)
-    
-    def optimize_weights(self, X: pd.DataFrame, y: pd.Series, cv: int = 5):
-        """
-        Optimize blending weights using cross-validation.
-        
-        Args:
-            X: Feature matrix
-            y: Target variable
-            cv: Number of cross-validation folds
-        """
-        from sklearn.model_selection import KFold
-        from scipy.optimize import minimize
-        
-        kf = KFold(n_splits=cv, shuffle=True, random_state=42)
-        
-        def objective(weights):
-            """Objective function to minimize."""
-            # Normalize weights
-            weights = weights / weights.sum()
-            
-            scores = []
-            for train_idx, val_idx in kf.split(X):
-                X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-                
-                # Get predictions from each model
-                val_preds = []
-                for name, model in self.models:
-                    # Clone and fit model
-                    model_clone = deepcopy(model)
-                    model_clone.fit(X_train, y_train)
-                    val_preds.append(model_clone.predict(X_val))
-                
-                # Blend predictions
-                blended = np.sum([pred * w for pred, w in zip(val_preds, weights)], axis=0)
-                
-                # Calculate error
-                from sklearn.metrics import mean_squared_error
-                score = mean_squared_error(y_val, blended)
-                scores.append(score)
-            
-            return np.mean(scores)
-        
-        # Optimize weights
-        initial_weights = np.array(self.weights)
-        bounds = [(0, 1) for _ in self.weights]
-        
-        result = minimize(objective, initial_weights, method='SLSQP', 
-                         bounds=bounds, constraints={'type': 'eq', 'fun': lambda x: x.sum() - 1})
-        
-        self.weights = result.x.tolist()
-        logger.info(f"Optimized weights: {dict(zip([name for name, _ in self.models], self.weights))}")
-
-
-# Example usage and testing
-def example_ensemble_usage():
-    """Example of using the ensemble classes."""
-    from sklearn.datasets import make_classification, make_regression
-    from sklearn.model_selection import train_test_split
-    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
-    from sklearn.svm import SVC, SVR
-    from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-    
-    # Classification example
-    print("=== Classification Example ===")
-    X, y = make_classification(n_samples=1000, n_features=20, n_informative=15, 
-                              n_redundant=5, random_state=42)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-    
-    # Define base classifiers
-    classifiers = [
-        ('dt', DecisionTreeClassifier(random_state=42)),
-        ('svc', SVC(probability=True, random_state=42)),
-        ('knn', KNeighborsClassifier())
-    ]
-    
-    # Test VotingEnsemble
-    print("\n1. VotingEnsemble (Soft Voting):")
-    voting = VotingEnsemble(classifiers, voting='soft')
-    voting.fit(X_train, y_train)
-    score = voting.predict(X_test).mean()
-    print(f"   Accuracy: {score:.3f}")
-    
-    # Test StackingEnsemble
-    print("\n2. StackingEnsemble:")
-    stacking = StackingEnsemble(classifiers)
-    stacking.fit(X_train, y_train)
-    score = stacking.predict(X_test).mean()
-    print(f"   Accuracy: {score:.3f}")
-    
-    # Test BaggingEnsemble
-    print("\n3. BaggingEnsemble:")
-    bagging = BaggingEnsemble(
-        base_estimator=DecisionTreeClassifier(random_state=42),
-        n_estimators=10,
-        random_state=42
-    )
-    bagging.fit(X_train, y_train)
-    score = bagging.predict(X_test).mean()
-    print(f"   Accuracy: {score:.3f}")
-    
-    # Test WeightedEnsemble
-    print("\n4. WeightedEnsemble (Optimized Weights):")
-    weighted = WeightedEnsemble(classifiers)
-    weighted.fit(X_train, y_train)
-    score = weighted.predict(X_test).mean()
-    print(f"   Accuracy: {score:.3f}")
-    print(f"   Optimized weights: {weighted.get_estimator_weights()}")
-    
-    # Regression example
-    print("\n\n=== Regression Example ===")
-    X, y = make_regression(n_samples=1000, n_features=20, n_informative=15, 
-                          noise=0.1, random_state=42)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-    
-    # Define base regressors
-    regressors = [
-        ('dt', DecisionTreeRegressor(random_state=42)),
-        ('svr', SVR()),
-        ('knn', KNeighborsRegressor())
-    ]
-    
-    # Test with regression task
-    print("\n1. VotingEnsemble (Averaging):")
-    voting_reg = VotingEnsemble(regressors)
-    voting_reg.fit(X_train, y_train)
-    pred = voting_reg.predict(X_test)
-    from sklearn.metrics import r2_score
-    print(f"   R² Score: {r2_score(y_test, pred):.3f}")
-    
-    print("\n2. WeightedEnsemble (Optimized Weights):")
-    weighted_reg = WeightedEnsemble(regressors)
-    weighted_reg.fit(X_train, y_train)
-    pred = weighted_reg.predict(X_test)
-    print(f"   R² Score: {r2_score(y_test, pred):.3f}")
-    print(f"   Optimized weights: {weighted_reg.get_estimator_weights()}")
-
-
+# Example usage
 if __name__ == "__main__":
-    example_ensemble_usage()
+    # Generate sample data
+    from sklearn.datasets import make_classification
+    from sklearn.model_selection import train_test_split
+    
+    X, y = make_classification(n_samples=1000, n_features=20, n_classes=2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Example 1: Voting Ensemble
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.svm import SVC
+    from sklearn.linear_model import LogisticRegression
+    
+    estimators = [
+        ('rf', RandomForestClassifier(n_estimators=10, random_state=42)),
+        ('svc', SVC(probability=True, random_state=42)),
+        ('lr', LogisticRegression(random_state=42))
+    ]
+    
+    voting = VotingEnsemble(estimators=estimators, voting='soft')
+    voting.fit(X_train, y_train)
+    print(f"Voting accuracy: {voting.predict(X_test).mean():.4f}")
+    
+    # Example 2: Model Stacker
+    stacker = ModelStacker(base_models=estimators, task_type='classification')
+    stacker.fit(X_train, y_train)
+    print(f"Stacking accuracy: {(stacker.predict(X_test) == y_test).mean():.4f}")
+    
+    # Example 3: EnsembleModel with auto-selection
+    ensemble = EnsembleModel(task_type='classification', model_type='auto')
+    ensemble.fit(X_train, y_train, tune_hyperparameters=True, cv=3)
+    print(f"Auto-ensemble accuracy: {(ensemble.predict(X_test) == y_test).mean():.4f}")

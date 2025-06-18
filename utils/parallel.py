@@ -11,6 +11,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple, Iterable, TypeVar
 import numpy as np
 import pandas as pd
+import functools
 from functools import partial, wraps
 from tqdm import tqdm
 import logging
@@ -1415,7 +1416,6 @@ def parallel_save_partitions(df: pd.DataFrame, output_dir: str,
 def example_parallel_processing():
     """Example of parallel processing utilities."""
     import time
-    import functools
     
     # Example function
     def expensive_computation(x):
