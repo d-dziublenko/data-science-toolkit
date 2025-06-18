@@ -9,7 +9,7 @@ import yaml
 import pickle
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Tuple, Callable
+from typing import Any, Dict, List, Optional, Union, Tuple, Callable, Set
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -21,6 +21,10 @@ import sqlite3
 from contextlib import contextmanager
 import matplotlib.pyplot as plt
 import seaborn as sns
+import warnings
+from collections import defaultdict
+import tempfile
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +107,7 @@ class ExperimentTracker:
                     created_at TIMESTAMP,
                     updated_at TIMESTAMP,
                     completed_at TIMESTAMP,
-                    config TEXT,
-                    tags TEXT,
-                    metrics_summary TEXT
+                    config TEXT
                 )
             """)
             
@@ -118,18 +120,18 @@ class ExperimentTracker:
                     metric_value REAL,
                     step INTEGER,
                     timestamp TIMESTAMP,
-                    FOREIGN KEY (experiment_id) REFERENCES experiments (id)
+                    FOREIGN KEY (experiment_id) REFERENCES experiments(id)
                 )
             """)
             
             # Create parameters table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS parameters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     experiment_id TEXT,
                     param_name TEXT,
                     param_value TEXT,
-                    param_type TEXT,
-                    FOREIGN KEY (experiment_id) REFERENCES experiments (id)
+                    FOREIGN KEY (experiment_id) REFERENCES experiments(id)
                 )
             """)
             
@@ -322,54 +324,24 @@ class ExperimentTracker:
         Log a trained model.
         
         Args:
-            model: Model object
-            model_name: Name for saved model
+            model: Model to save
+            model_name: Name for model file
             experiment_id: Experiment ID
         """
         exp_id = experiment_id or self.current_experiment
         if not exp_id:
             raise ValueError("No active experiment")
         
-        exp_dir = self.base_dir / exp_id
-        models_dir = exp_dir / "models"
-        models_dir.mkdir(exist_ok=True)
-        
-        model_path = models_dir / model_name
-        
-        # Save model
-        import joblib
-        joblib.dump(model, model_path)
+        # Save model to temp file
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            pickle.dump(model, f)
+            temp_path = f.name
         
         # Log as artifact
-        self.log_artifact(model_path, model_name, "model", exp_id)
+        self.log_artifact(temp_path, model_name, "model", exp_id)
         
-        # Save model metadata
-        metadata = {
-            'model_class': model.__class__.__name__,
-            'model_params': model.get_params() if hasattr(model, 'get_params') else {},
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        with open(models_dir / f"{model_name}.metadata.json", 'w') as f:
-            json.dump(metadata, f, indent=2)
-    
-    def log_dataset_info(self, dataset_info: Dict[str, Any],
-                        experiment_id: Optional[str] = None):
-        """
-        Log dataset information.
-        
-        Args:
-            dataset_info: Dataset metadata
-            experiment_id: Experiment ID
-        """
-        exp_id = experiment_id or self.current_experiment
-        if not exp_id:
-            raise ValueError("No active experiment")
-        
-        exp_dir = self.base_dir / exp_id
-        
-        with open(exp_dir / "dataset_info.json", 'w') as f:
-            json.dump(dataset_info, f, indent=2)
+        # Clean up temp file
+        os.unlink(temp_path)
     
     def get_experiment(self, experiment_id: str) -> Dict[str, Any]:
         """
@@ -379,7 +351,7 @@ class ExperimentTracker:
             experiment_id: Experiment ID
             
         Returns:
-            Experiment information
+            Experiment configuration and metadata
         """
         exp_dir = self.base_dir / experiment_id
         
@@ -390,26 +362,23 @@ class ExperimentTracker:
         with open(exp_dir / "config.json", 'r') as f:
             config = json.load(f)
         
-        # Load metrics
-        metrics = self.get_metrics(experiment_id)
-        
         # Load parameters
         params_file = exp_dir / "parameters.json"
         if params_file.exists():
             with open(params_file, 'r') as f:
-                params = json.load(f)
-        else:
-            params = {}
+                config['parameters'] = json.load(f)
         
-        return {
-            'config': config,
-            'parameters': params,
-            'metrics': metrics
-        }
+        # Count metrics
+        metrics_file = exp_dir / "metrics.jsonl"
+        if metrics_file.exists():
+            with open(metrics_file, 'r') as f:
+                config['n_metrics'] = sum(1 for _ in f)
+        
+        return config
     
     def get_metrics(self, experiment_id: str) -> pd.DataFrame:
         """
-        Get metrics for an experiment.
+        Get all metrics for an experiment.
         
         Args:
             experiment_id: Experiment ID
@@ -484,102 +453,38 @@ class ExperimentTracker:
         Returns:
             Comparison DataFrame
         """
-        comparison_data = []
+        comparisons = []
         
         for exp_id in experiment_ids:
-            exp_data = self.get_experiment(exp_id)
-            
-            # Get final metrics
-            metrics_df = self.get_metrics(exp_id)
-            
-            if not metrics_df.empty:
-                # Get last value for each metric
-                final_metrics = {}
-                for metric_name in metrics_df['name'].unique():
-                    if metrics is None or metric_name in metrics:
-                        metric_values = metrics_df[metrics_df['name'] == metric_name]
-                        final_metrics[metric_name] = metric_values.iloc[-1]['value']
+            try:
+                # Get experiment info
+                exp_info = self.get_experiment(exp_id)
                 
-                row = {
-                    'experiment_id': exp_id,
-                    'name': exp_data['config']['name'],
-                    **exp_data['parameters'],
-                    **final_metrics
-                }
+                # Get final metrics
+                exp_metrics = self.get_metrics(exp_id)
                 
-                comparison_data.append(row)
+                if not exp_metrics.empty:
+                    # Get last value for each metric
+                    final_metrics = {}
+                    for metric_name in exp_metrics['name'].unique():
+                        if metrics is None or metric_name in metrics:
+                            metric_data = exp_metrics[exp_metrics['name'] == metric_name]
+                            final_metrics[metric_name] = metric_data.iloc[-1]['value']
+                    
+                    # Create comparison entry
+                    comparison = {
+                        'experiment_id': exp_id,
+                        'name': exp_info['name'],
+                        'status': exp_info.get('status'),
+                        **final_metrics
+                    }
+                    
+                    comparisons.append(comparison)
+                    
+            except Exception as e:
+                logger.error(f"Error comparing experiment {exp_id}: {e}")
         
-        return pd.DataFrame(comparison_data)
-    
-    def plot_metrics(self, experiment_ids: Union[str, List[str]],
-                    metrics: Optional[List[str]] = None,
-                    figsize: Tuple[int, int] = (12, 8)) -> plt.Figure:
-        """
-        Plot metrics for experiments.
-        
-        Args:
-            experiment_ids: Experiment ID(s)
-            metrics: Metrics to plot
-            figsize: Figure size
-            
-        Returns:
-            Matplotlib figure
-        """
-        if isinstance(experiment_ids, str):
-            experiment_ids = [experiment_ids]
-        
-        # Collect metrics data
-        all_metrics = {}
-        
-        for exp_id in experiment_ids:
-            metrics_df = self.get_metrics(exp_id)
-            
-            if not metrics_df.empty:
-                for metric_name in metrics_df['name'].unique():
-                    if metrics is None or metric_name in metrics:
-                        if metric_name not in all_metrics:
-                            all_metrics[metric_name] = {}
-                        
-                        metric_data = metrics_df[metrics_df['name'] == metric_name]
-                        all_metrics[metric_name][exp_id] = metric_data
-        
-        # Create plots
-        n_metrics = len(all_metrics)
-        if n_metrics == 0:
-            logger.warning("No metrics to plot")
-            return None
-        
-        fig, axes = plt.subplots(
-            nrows=(n_metrics + 1) // 2,
-            ncols=min(2, n_metrics),
-            figsize=figsize,
-            squeeze=False
-        )
-        axes = axes.flatten()
-        
-        for idx, (metric_name, exp_data) in enumerate(all_metrics.items()):
-            ax = axes[idx]
-            
-            for exp_id, data in exp_data.items():
-                if 'step' in data.columns and data['step'].notna().any():
-                    x = data['step']
-                else:
-                    x = range(len(data))
-                
-                ax.plot(x, data['value'], label=exp_id, marker='o')
-            
-            ax.set_title(metric_name)
-            ax.set_xlabel('Step')
-            ax.set_ylabel('Value')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        # Hide extra subplots
-        for idx in range(n_metrics, len(axes)):
-            axes[idx].set_visible(False)
-        
-        plt.tight_layout()
-        return fig
+        return pd.DataFrame(comparisons)
     
     def _save_experiment_to_db(self, exp_id: str, config: Dict[str, Any]):
         """Save experiment to database."""
@@ -587,16 +492,15 @@ class ExperimentTracker:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO experiments 
-                (id, name, description, status, created_at, config, tags)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, name, description, status, created_at, config)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 exp_id,
                 config['name'],
                 config.get('description', ''),
-                config['status'],
-                config['created_at'],
-                json.dumps(config),
-                json.dumps(config.get('tags', []))
+                config.get('status'),
+                config.get('created_at'),
+                json.dumps(config)
             ))
             conn.commit()
     
@@ -607,14 +511,9 @@ class ExperimentTracker:
             for name, value in params.items():
                 cursor.execute("""
                     INSERT INTO parameters 
-                    (experiment_id, param_name, param_value, param_type)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    exp_id,
-                    name,
-                    str(value),
-                    type(value).__name__
-                ))
+                    (experiment_id, param_name, param_value)
+                    VALUES (?, ?, ?)
+                """, (exp_id, name, str(value)))
             conn.commit()
     
     def _save_metric_to_db(self, exp_id: str, metric: Dict[str, Any]):
@@ -694,6 +593,957 @@ class ExperimentContext:
             json.dump(config, f, indent=2)
         
         self.tracker.current_experiment = None
+
+
+class MLFlowTracker:
+    """
+    MLflow-compatible experiment tracker.
+    
+    This class provides an MLflow-like API interface while using
+    the ExperimentTracker backend.
+    """
+    
+    def __init__(self, tracking_uri: str = "experiments",
+                 experiment_name: str = "Default"):
+        """
+        Initialize MLFlowTracker.
+        
+        Args:
+            tracking_uri: URI for tracking (directory path)
+            experiment_name: Default experiment name
+        """
+        self.tracker = ExperimentTracker(base_dir=tracking_uri)
+        self.experiment_name = experiment_name
+        self.active_run = None
+        self._runs = {}
+        
+        logger.info(f"Initialized MLFlowTracker at {tracking_uri}")
+    
+    def set_experiment(self, experiment_name: str):
+        """
+        Set the active experiment.
+        
+        Args:
+            experiment_name: Name of experiment
+        """
+        self.experiment_name = experiment_name
+    
+    def start_run(self, run_name: Optional[str] = None,
+                  nested: bool = False,
+                  tags: Optional[Dict[str, str]] = None,
+                  description: Optional[str] = None) -> 'MLFlowRun':
+        """
+        Start a new run.
+        
+        Args:
+            run_name: Name for the run
+            nested: Whether this is a nested run
+            tags: Tags for the run
+            description: Run description
+            
+        Returns:
+            MLFlowRun context manager
+        """
+        if self.active_run and not nested:
+            raise RuntimeError("Run already active. Set nested=True for nested runs.")
+        
+        # Create experiment config
+        config = ExperimentConfig(
+            name=run_name or self.experiment_name,
+            description=description or "",
+            tags=list(tags.keys()) if tags else []
+        )
+        
+        # Create experiment
+        run_id = self.tracker.create_experiment(config)
+        
+        # Create run object
+        run = MLFlowRun(self, run_id)
+        
+        # Store run
+        self._runs[run_id] = run
+        
+        # Log tags as parameters
+        if tags:
+            self.log_params(tags)
+        
+        if not nested:
+            self.active_run = run
+        
+        return run
+    
+    def end_run(self, status: str = "FINISHED"):
+        """
+        End the current run.
+        
+        Args:
+            status: Run status
+        """
+        if self.active_run:
+            self.active_run.end(status)
+            self.active_run = None
+    
+    def log_param(self, key: str, value: Any):
+        """
+        Log a parameter.
+        
+        Args:
+            key: Parameter name
+            value: Parameter value
+        """
+        if not self.active_run:
+            raise RuntimeError("No active run")
+        
+        self.tracker.log_params({key: value}, self.active_run.run_id)
+    
+    def log_params(self, params: Dict[str, Any]):
+        """
+        Log multiple parameters.
+        
+        Args:
+            params: Dictionary of parameters
+        """
+        if not self.active_run:
+            raise RuntimeError("No active run")
+        
+        self.tracker.log_params(params, self.active_run.run_id)
+    
+    def log_metric(self, key: str, value: float, step: Optional[int] = None):
+        """
+        Log a metric.
+        
+        Args:
+            key: Metric name
+            value: Metric value
+            step: Optional step
+        """
+        if not self.active_run:
+            raise RuntimeError("No active run")
+        
+        self.tracker.log_metric(key, value, step, self.active_run.run_id)
+    
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
+        """
+        Log multiple metrics.
+        
+        Args:
+            metrics: Dictionary of metrics
+            step: Optional step
+        """
+        if not self.active_run:
+            raise RuntimeError("No active run")
+        
+        self.tracker.log_metrics(metrics, step, self.active_run.run_id)
+    
+    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None):
+        """
+        Log an artifact.
+        
+        Args:
+            local_path: Local path to artifact
+            artifact_path: Artifact path in run
+        """
+        if not self.active_run:
+            raise RuntimeError("No active run")
+        
+        self.tracker.log_artifact(local_path, artifact_path, 
+                                 experiment_id=self.active_run.run_id)
+    
+    def log_artifacts(self, local_dir: str, artifact_path: Optional[str] = None):
+        """
+        Log all artifacts in a directory.
+        
+        Args:
+            local_dir: Local directory path
+            artifact_path: Artifact path in run
+        """
+        local_dir = Path(local_dir)
+        
+        for file_path in local_dir.rglob("*"):
+            if file_path.is_file():
+                self.log_artifact(str(file_path))
+    
+    def log_model(self, model: Any, artifact_path: str,
+                  registered_model_name: Optional[str] = None):
+        """
+        Log a model.
+        
+        Args:
+            model: Model to log
+            artifact_path: Path to save model
+            registered_model_name: Optional model registry name
+        """
+        if not self.active_run:
+            raise RuntimeError("No active run")
+        
+        # Save model
+        self.tracker.log_model(model, artifact_path, self.active_run.run_id)
+        
+        # Register model if name provided
+        if registered_model_name:
+            self._register_model(registered_model_name, self.active_run.run_id)
+    
+    def _register_model(self, name: str, run_id: str):
+        """Register a model in the registry."""
+        registry_file = self.tracker.base_dir / "model_registry.json"
+        
+        if registry_file.exists():
+            with open(registry_file, 'r') as f:
+                registry = json.load(f)
+        else:
+            registry = {}
+        
+        if name not in registry:
+            registry[name] = []
+        
+        registry[name].append({
+            'run_id': run_id,
+            'timestamp': datetime.now().isoformat(),
+            'version': len(registry[name]) + 1
+        })
+        
+        with open(registry_file, 'w') as f:
+            json.dump(registry, f, indent=2)
+    
+    def search_runs(self, experiment_ids: Optional[List[str]] = None,
+                   filter_string: Optional[str] = None,
+                   max_results: int = 100) -> pd.DataFrame:
+        """
+        Search for runs.
+        
+        Args:
+            experiment_ids: List of experiment IDs to search
+            filter_string: Filter string (simplified)
+            max_results: Maximum results to return
+            
+        Returns:
+            DataFrame of runs
+        """
+        all_experiments = self.tracker.list_experiments()
+        
+        if experiment_ids:
+            all_experiments = [e for e in all_experiments 
+                             if e['id'] in experiment_ids]
+        
+        # Simple filter implementation
+        if filter_string:
+            # This is a simplified version - real MLflow has complex filtering
+            filtered = []
+            for exp in all_experiments:
+                if filter_string.lower() in exp['name'].lower():
+                    filtered.append(exp)
+            all_experiments = filtered
+        
+        # Limit results
+        all_experiments = all_experiments[:max_results]
+        
+        # Convert to DataFrame
+        return pd.DataFrame(all_experiments)
+    
+    def get_metric_history(self, run_id: str, key: str) -> List[Dict[str, Any]]:
+        """
+        Get metric history for a run.
+        
+        Args:
+            run_id: Run ID
+            key: Metric key
+            
+        Returns:
+            List of metric values
+        """
+        metrics_df = self.tracker.get_metrics(run_id)
+        
+        if metrics_df.empty:
+            return []
+        
+        metric_data = metrics_df[metrics_df['name'] == key]
+        
+        return metric_data.to_dict('records')
+
+
+class MLFlowRun:
+    """MLflow run context manager."""
+    
+    def __init__(self, mlflow_tracker: MLFlowTracker, run_id: str):
+        self.mlflow_tracker = mlflow_tracker
+        self.run_id = run_id
+        self.start_time = datetime.now()
+    
+    def __enter__(self):
+        self.mlflow_tracker.tracker.current_experiment = self.run_id
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.end("FINISHED")
+        else:
+            self.end("FAILED")
+    
+    def end(self, status: str = "FINISHED"):
+        """End the run."""
+        # Update run status
+        exp_dir = self.mlflow_tracker.tracker.base_dir / self.run_id
+        with open(exp_dir / "config.json", 'r') as f:
+            config = json.load(f)
+        
+        config['mlflow_status'] = status
+        config['end_time'] = datetime.now().isoformat()
+        config['duration'] = (datetime.now() - self.start_time).total_seconds()
+        
+        with open(exp_dir / "config.json", 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        self.mlflow_tracker.tracker.current_experiment = None
+
+
+class WandbTracker:
+    """
+    Weights & Biases (wandb) compatible experiment tracker.
+    
+    This class provides a wandb-like API interface while using
+    the ExperimentTracker backend.
+    """
+    
+    def __init__(self, project: str = "my-project",
+                 entity: Optional[str] = None,
+                 dir: str = "experiments"):
+        """
+        Initialize WandbTracker.
+        
+        Args:
+            project: Project name
+            entity: Entity/team name
+            dir: Directory for experiments
+        """
+        self.project = project
+        self.entity = entity
+        self.tracker = ExperimentTracker(base_dir=Path(dir) / project)
+        self.run = None
+        self._config = {}
+        self._summary = {}
+        
+        logger.info(f"Initialized WandbTracker for project: {project}")
+    
+    def init(self, name: Optional[str] = None,
+             config: Optional[Dict[str, Any]] = None,
+             project: Optional[str] = None,
+             tags: Optional[List[str]] = None,
+             notes: Optional[str] = None,
+             reinit: bool = False) -> 'WandbRun':
+        """
+        Initialize a new run.
+        
+        Args:
+            name: Run name
+            config: Configuration dictionary
+            project: Project name (overrides default)
+            tags: List of tags
+            notes: Run notes
+            reinit: Whether to reinitialize
+            
+        Returns:
+            WandbRun object
+        """
+        if self.run and not reinit:
+            raise RuntimeError("Run already initialized. Set reinit=True to start new run.")
+        
+        # Update project if provided
+        if project:
+            self.project = project
+        
+        # Create experiment config
+        exp_config = ExperimentConfig(
+            name=name or f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            description=notes or "",
+            tags=tags or [],
+            hyperparameters=config or {}
+        )
+        
+        # Create experiment
+        run_id = self.tracker.create_experiment(exp_config)
+        
+        # Create run
+        self.run = WandbRun(self, run_id)
+        
+        # Set config
+        if config:
+            self.config.update(config)
+            self.tracker.log_params(config, run_id)
+        
+        return self.run
+    
+    def log(self, data: Dict[str, Any], step: Optional[int] = None,
+            commit: bool = True):
+        """
+        Log metrics.
+        
+        Args:
+            data: Dictionary of metrics
+            step: Optional step
+            commit: Whether to commit immediately
+        """
+        if not self.run:
+            raise RuntimeError("No active run. Call wandb.init() first.")
+        
+        # Log metrics
+        for key, value in data.items():
+            if isinstance(value, (int, float)):
+                self.tracker.log_metric(key, value, step, self.run.id)
+                self._summary[key] = value
+    
+    def log_artifact(self, artifact_or_path: Union[str, 'WandbArtifact'],
+                    name: Optional[str] = None,
+                    type: Optional[str] = None):
+        """
+        Log an artifact.
+        
+        Args:
+            artifact_or_path: Artifact or path to artifact
+            name: Artifact name
+            type: Artifact type
+        """
+        if not self.run:
+            raise RuntimeError("No active run. Call wandb.init() first.")
+        
+        if isinstance(artifact_or_path, str):
+            self.tracker.log_artifact(artifact_or_path, name, type or "artifact",
+                                    self.run.id)
+        else:
+            # Handle WandbArtifact
+            artifact_or_path.save(self.tracker.base_dir / self.run.id / "artifacts")
+    
+    def finish(self, exit_code: int = 0):
+        """
+        Finish the current run.
+        
+        Args:
+            exit_code: Exit code (0 for success)
+        """
+        if self.run:
+            self.run.finish(exit_code)
+            self.run = None
+    
+    @property
+    def config(self) -> Dict[str, Any]:
+        """Get run configuration."""
+        return self._config
+    
+    @config.setter
+    def config(self, value: Dict[str, Any]):
+        """Set run configuration."""
+        self._config = value
+        if self.run:
+            self.tracker.log_params(value, self.run.id)
+    
+    @property
+    def summary(self) -> Dict[str, Any]:
+        """Get run summary."""
+        return self._summary
+    
+    def watch(self, model: Any, log: str = "gradients", log_freq: int = 100):
+        """
+        Watch a model (placeholder for compatibility).
+        
+        Args:
+            model: Model to watch
+            log: What to log
+            log_freq: Logging frequency
+        """
+        logger.info(f"Model watching not implemented. Would watch: {type(model).__name__}")
+    
+    def alert(self, title: str, text: str, level: str = "INFO"):
+        """
+        Send an alert (logs to file).
+        
+        Args:
+            title: Alert title
+            text: Alert text
+            level: Alert level
+        """
+        if self.run:
+            alert_file = self.tracker.base_dir / self.run.id / "alerts.jsonl"
+            alert = {
+                'title': title,
+                'text': text,
+                'level': level,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            with open(alert_file, 'a') as f:
+                f.write(json.dumps(alert) + '\n')
+
+
+class WandbRun:
+    """W&B run object."""
+    
+    def __init__(self, wandb_tracker: WandbTracker, run_id: str):
+        self.wandb_tracker = wandb_tracker
+        self.id = run_id
+        self.name = run_id.split('_')[0]
+        self.project = wandb_tracker.project
+        self.entity = wandb_tracker.entity
+        self.start_time = datetime.now()
+        
+    def finish(self, exit_code: int = 0):
+        """Finish the run."""
+        # Update run status
+        exp_dir = self.wandb_tracker.tracker.base_dir / self.id
+        with open(exp_dir / "config.json", 'r') as f:
+            config = json.load(f)
+        
+        config['wandb_exit_code'] = exit_code
+        config['wandb_state'] = "finished" if exit_code == 0 else "failed"
+        config['runtime'] = (datetime.now() - self.start_time).total_seconds()
+        
+        with open(exp_dir / "config.json", 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        self.wandb_tracker.tracker.current_experiment = None
+    
+    @property
+    def url(self) -> str:
+        """Get run URL (local path)."""
+        return str(self.wandb_tracker.tracker.base_dir / self.id)
+    
+    @property
+    def summary(self) -> Dict[str, Any]:
+        """Get run summary."""
+        return self.wandb_tracker.summary
+
+
+class WandbArtifact:
+    """W&B artifact placeholder."""
+    
+    def __init__(self, name: str, type: str = "artifact"):
+        self.name = name
+        self.type = type
+        self._files = []
+    
+    def add_file(self, local_path: str, name: Optional[str] = None):
+        """Add file to artifact."""
+        self._files.append((local_path, name or Path(local_path).name))
+    
+    def add_dir(self, local_path: str):
+        """Add directory to artifact."""
+        path = Path(local_path)
+        for file_path in path.rglob("*"):
+            if file_path.is_file():
+                rel_path = file_path.relative_to(path)
+                self._files.append((str(file_path), str(rel_path)))
+    
+    def save(self, save_path: Path):
+        """Save artifact to path."""
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        for src, dst in self._files:
+            dst_path = save_path / dst
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst_path)
+
+
+class ExperimentComparer:
+    """
+    Advanced experiment comparison and analysis tool.
+    
+    Provides comprehensive comparison, visualization, and analysis
+    of multiple experiments.
+    """
+    
+    def __init__(self, tracker: ExperimentTracker):
+        """
+        Initialize ExperimentComparer.
+        
+        Args:
+            tracker: ExperimentTracker instance
+        """
+        self.tracker = tracker
+        
+    def compare_experiments(self,
+                          experiment_ids: List[str],
+                          metrics: Optional[List[str]] = None,
+                          include_params: bool = True) -> pd.DataFrame:
+        """
+        Compare multiple experiments.
+        
+        Args:
+            experiment_ids: List of experiment IDs
+            metrics: Specific metrics to compare
+            include_params: Whether to include parameters
+            
+        Returns:
+            Comparison DataFrame
+        """
+        comparisons = []
+        
+        for exp_id in experiment_ids:
+            try:
+                # Get experiment details
+                exp_info = self.tracker.get_experiment(exp_id)
+                
+                # Build comparison entry
+                comparison = {
+                    'experiment_id': exp_id,
+                    'name': exp_info['name'],
+                    'status': exp_info.get('status'),
+                    'created_at': exp_info.get('created_at'),
+                    'duration': exp_info.get('duration_seconds')
+                }
+                
+                # Add parameters if requested
+                if include_params and 'parameters' in exp_info:
+                    for param, value in exp_info['parameters'].items():
+                        comparison[f'param_{param}'] = value
+                
+                # Get metrics
+                exp_metrics = self.tracker.get_metrics(exp_id)
+                
+                if not exp_metrics.empty:
+                    # Get final value for each metric
+                    for metric_name in exp_metrics['name'].unique():
+                        if metrics is None or metric_name in metrics:
+                            metric_data = exp_metrics[exp_metrics['name'] == metric_name]
+                            comparison[f'metric_{metric_name}'] = metric_data.iloc[-1]['value']
+                            
+                            # Also get best value
+                            if metric_name in ['loss', 'error', 'mae', 'mse']:
+                                comparison[f'best_{metric_name}'] = metric_data['value'].min()
+                            else:
+                                comparison[f'best_{metric_name}'] = metric_data['value'].max()
+                
+                comparisons.append(comparison)
+                
+            except Exception as e:
+                logger.error(f"Error loading experiment {exp_id}: {e}")
+        
+        return pd.DataFrame(comparisons)
+    
+    def plot_metrics_comparison(self,
+                              experiment_ids: List[str],
+                              metrics: List[str],
+                              figsize: Tuple[int, int] = (12, 8),
+                              save_path: Optional[str] = None):
+        """
+        Plot metrics comparison across experiments.
+        
+        Args:
+            experiment_ids: List of experiment IDs
+            metrics: List of metrics to plot
+            figsize: Figure size
+            save_path: Path to save plot
+        """
+        n_metrics = len(metrics)
+        fig, axes = plt.subplots(1, n_metrics, figsize=figsize)
+        
+        if n_metrics == 1:
+            axes = [axes]
+        
+        for idx, metric in enumerate(metrics):
+            ax = axes[idx]
+            
+            for exp_id in experiment_ids:
+                try:
+                    # Get metric data
+                    metrics_df = self.tracker.get_metrics(exp_id)
+                    
+                    if not metrics_df.empty and metric in metrics_df['name'].values:
+                        metric_data = metrics_df[metrics_df['name'] == metric]
+                        
+                        # Plot metric over steps
+                        steps = metric_data['step'].fillna(range(len(metric_data)))
+                        ax.plot(steps, metric_data['value'], 
+                               label=exp_id.split('_')[0], marker='.')
+                
+                except Exception as e:
+                    logger.error(f"Error plotting {metric} for {exp_id}: {e}")
+            
+            ax.set_xlabel('Step')
+            ax.set_ylabel(metric)
+            ax.set_title(f'{metric} Comparison')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+    
+    def plot_parallel_coordinates(self,
+                                experiment_ids: List[str],
+                                params: List[str],
+                                metric: str,
+                                normalize: bool = True,
+                                save_path: Optional[str] = None):
+        """
+        Create parallel coordinates plot.
+        
+        Args:
+            experiment_ids: List of experiment IDs
+            params: List of parameters to include
+            metric: Metric to color by
+            normalize: Whether to normalize values
+            save_path: Path to save plot
+        """
+        # Get comparison data
+        df = self.compare_experiments(experiment_ids)
+        
+        # Prepare data for parallel coordinates
+        plot_data = []
+        
+        for _, row in df.iterrows():
+            entry = {}
+            
+            # Add parameters
+            for param in params:
+                param_col = f'param_{param}'
+                if param_col in row:
+                    entry[param] = row[param_col]
+            
+            # Add metric
+            metric_col = f'metric_{metric}'
+            if metric_col in row:
+                entry[metric] = row[metric_col]
+                entry['experiment'] = row['experiment_id']
+                plot_data.append(entry)
+        
+        if not plot_data:
+            logger.warning("No data to plot")
+            return
+        
+        plot_df = pd.DataFrame(plot_data)
+        
+        # Normalize if requested
+        if normalize:
+            from sklearn.preprocessing import MinMaxScaler
+            scaler = MinMaxScaler()
+            
+            numeric_cols = [col for col in plot_df.columns 
+                          if col not in ['experiment', metric]]
+            plot_df[numeric_cols] = scaler.fit_transform(plot_df[numeric_cols])
+        
+        # Create plot
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Plot parallel coordinates
+        pd.plotting.parallel_coordinates(
+            plot_df.drop('experiment', axis=1),
+            metric,
+            colormap='viridis',
+            alpha=0.7,
+            ax=ax
+        )
+        
+        ax.set_title(f'Parallel Coordinates Plot - Colored by {metric}')
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+    
+    def find_best_experiment(self,
+                           experiment_ids: List[str],
+                           metric: str,
+                           mode: str = 'min') -> str:
+        """
+        Find best experiment based on metric.
+        
+        Args:
+            experiment_ids: List of experiment IDs
+            metric: Metric to optimize
+            mode: 'min' or 'max'
+            
+        Returns:
+            Best experiment ID
+        """
+        comparison_df = self.compare_experiments(experiment_ids, [metric])
+        
+        metric_col = f'metric_{metric}'
+        if metric_col not in comparison_df.columns:
+            raise ValueError(f"Metric {metric} not found in experiments")
+        
+        if mode == 'min':
+            best_idx = comparison_df[metric_col].idxmin()
+        else:
+            best_idx = comparison_df[metric_col].idxmax()
+        
+        return comparison_df.loc[best_idx, 'experiment_id']
+    
+    def generate_report(self,
+                       experiment_ids: List[str],
+                       output_path: str = "experiment_report.html",
+                       include_plots: bool = True):
+        """
+        Generate comprehensive experiment report.
+        
+        Args:
+            experiment_ids: List of experiment IDs
+            output_path: Path for report
+            include_plots: Whether to include plots
+        """
+        # Create report content
+        html_content = """
+        <html>
+        <head>
+            <title>Experiment Report</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f2f2f2; }
+                .metric { color: #2e7d32; font-weight: bold; }
+                .param { color: #1976d2; }
+                h1, h2 { color: #333; }
+                .plot { margin: 20px 0; text-align: center; }
+            </style>
+        </head>
+        <body>
+        """
+        
+        # Add header
+        html_content += f"""
+        <h1>Experiment Comparison Report</h1>
+        <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p>Number of experiments: {len(experiment_ids)}</p>
+        """
+        
+        # Get comparison data
+        comparison_df = self.compare_experiments(experiment_ids)
+        
+        # Add summary table
+        html_content += "<h2>Experiment Summary</h2>"
+        html_content += comparison_df.to_html(classes='summary-table', index=False)
+        
+        # Add detailed experiment information
+        html_content += "<h2>Detailed Experiment Information</h2>"
+        
+        for exp_id in experiment_ids:
+            try:
+                exp_info = self.tracker.get_experiment(exp_id)
+                
+                html_content += f"<h3>{exp_id}</h3>"
+                html_content += "<ul>"
+                html_content += f"<li><strong>Name:</strong> {exp_info['name']}</li>"
+                html_content += f"<li><strong>Status:</strong> {exp_info.get('status', 'Unknown')}</li>"
+                html_content += f"<li><strong>Created:</strong> {exp_info.get('created_at', 'Unknown')}</li>"
+                
+                if 'description' in exp_info:
+                    html_content += f"<li><strong>Description:</strong> {exp_info['description']}</li>"
+                
+                if 'parameters' in exp_info:
+                    html_content += "<li><strong>Parameters:</strong><ul>"
+                    for param, value in exp_info['parameters'].items():
+                        html_content += f"<li class='param'>{param}: {value}</li>"
+                    html_content += "</ul></li>"
+                
+                # Get final metrics
+                metrics_df = self.tracker.get_metrics(exp_id)
+                if not metrics_df.empty:
+                    html_content += "<li><strong>Final Metrics:</strong><ul>"
+                    
+                    for metric_name in metrics_df['name'].unique():
+                        final_value = metrics_df[metrics_df['name'] == metric_name].iloc[-1]['value']
+                        html_content += f"<li class='metric'>{metric_name}: {final_value:.4f}</li>"
+                    
+                    html_content += "</ul></li>"
+                
+                html_content += "</ul>"
+                
+            except Exception as e:
+                html_content += f"<p>Error loading experiment {exp_id}: {e}</p>"
+        
+        # Add plots if requested
+        if include_plots and len(experiment_ids) > 1:
+            html_content += "<h2>Metric Comparisons</h2>"
+            
+            # Get all metrics
+            all_metrics = set()
+            for exp_id in experiment_ids:
+                metrics_df = self.tracker.get_metrics(exp_id)
+                if not metrics_df.empty:
+                    all_metrics.update(metrics_df['name'].unique())
+            
+            # Create plots
+            for metric in all_metrics:
+                plot_path = f"plot_{metric}.png"
+                
+                try:
+                    self.plot_metrics_comparison(
+                        experiment_ids, [metric],
+                        save_path=plot_path
+                    )
+                    
+                    html_content += f"""
+                    <div class='plot'>
+                        <h3>{metric}</h3>
+                        <img src='{plot_path}' width='600'>
+                    </div>
+                    """
+                except Exception as e:
+                    logger.error(f"Error creating plot for {metric}: {e}")
+        
+        # Close HTML
+        html_content += """
+        </body>
+        </html>
+        """
+        
+        # Save report
+        with open(output_path, 'w') as f:
+            f.write(html_content)
+        
+        logger.info(f"Report saved to {output_path}")
+    
+    def get_parameter_importance(self,
+                               experiment_ids: List[str],
+                               target_metric: str) -> pd.DataFrame:
+        """
+        Analyze parameter importance for a metric.
+        
+        Args:
+            experiment_ids: List of experiment IDs
+            target_metric: Target metric to analyze
+            
+        Returns:
+            DataFrame with parameter importance
+        """
+        # Get comparison data
+        df = self.compare_experiments(experiment_ids)
+        
+        # Extract parameter columns and target metric
+        param_cols = [col for col in df.columns if col.startswith('param_')]
+        metric_col = f'metric_{target_metric}'
+        
+        if metric_col not in df.columns:
+            raise ValueError(f"Metric {target_metric} not found")
+        
+        # Calculate correlations
+        correlations = []
+        
+        for param_col in param_cols:
+            try:
+                # Convert to numeric if possible
+                param_values = pd.to_numeric(df[param_col], errors='coerce')
+                
+                if not param_values.isna().all():
+                    corr = param_values.corr(df[metric_col])
+                    
+                    correlations.append({
+                        'parameter': param_col.replace('param_', ''),
+                        'correlation': corr,
+                        'abs_correlation': abs(corr)
+                    })
+            except Exception as e:
+                logger.debug(f"Could not calculate correlation for {param_col}: {e}")
+        
+        # Create importance DataFrame
+        importance_df = pd.DataFrame(correlations)
+        importance_df = importance_df.sort_values('abs_correlation', ascending=False)
+        
+        return importance_df
 
 
 # Integration with MLflow-style API
@@ -783,74 +1633,83 @@ def example_experiment_tracking():
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
         
         # Log dataset info
-        exp.log_dataset_info({
+        exp.log_params({
             "n_samples": len(X),
             "n_features": X.shape[1],
-            "n_classes": len(np.unique(y)),
-            "train_size": len(X_train),
-            "test_size": len(X_test)
+            "test_size": 0.2
         })
         
         # Train model
         model = RandomForestClassifier(**config.hyperparameters)
+        model.fit(X_train, y_train)
         
-        # Training loop simulation
+        # Evaluate
+        y_pred = model.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+        
+        # Log metrics
+        exp.log_metrics({
+            "accuracy": accuracy,
+            "f1_score": f1
+        })
+        
+        # Save model
+        exp.log_model(model, "model.pkl")
+    
+    print(f"Experiment {exp_id} completed!")
+    
+    # Example with MLFlow API
+    print("\n--- MLFlow API Example ---")
+    mlflow = MLFlowTracker()
+    
+    with mlflow.start_run(run_name="mlflow_example"):
+        mlflow.log_params({
+            "learning_rate": 0.01,
+            "batch_size": 32
+        })
+        
         for epoch in range(5):
-            # Fit on subset for demonstration
-            subset_size = (epoch + 1) * 200
-            model.fit(X_train[:subset_size], y_train[:subset_size])
-            
-            # Evaluate
-            train_pred = model.predict(X_train[:subset_size])
-            test_pred = model.predict(X_test)
-            
-            train_acc = accuracy_score(y_train[:subset_size], train_pred)
-            test_acc = accuracy_score(y_test, test_pred)
-            test_f1 = f1_score(y_test, test_pred, average='weighted')
-            
-            # Log metrics
-            exp.log_metrics({
-                "train_accuracy": train_acc,
-                "test_accuracy": test_acc,
-                "test_f1": test_f1
-            }, step=epoch)
-            
-            print(f"Epoch {epoch}: Train Acc={train_acc:.3f}, Test Acc={test_acc:.3f}")
-        
-        # Log final model
-        exp.log_model(model, "final_model.pkl")
-        
-        # Log additional artifacts
-        feature_importance = pd.DataFrame({
-            'feature': [f'feature_{i}' for i in range(X.shape[1])],
-            'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        
-        feature_importance.to_csv("feature_importance.csv", index=False)
-        exp.log_artifact("feature_importance.csv", artifact_type="results")
+            mlflow.log_metric("loss", 1.0 / (epoch + 1), step=epoch)
+            mlflow.log_metric("accuracy", 0.8 + epoch * 0.02, step=epoch)
+    
+    # Example with W&B API
+    print("\n--- W&B API Example ---")
+    wandb = WandbTracker(project="my-awesome-project")
+    
+    wandb.init(
+        name="wandb_example",
+        config={
+            "learning_rate": 0.001,
+            "architecture": "CNN",
+            "dataset": "CIFAR-10"
+        }
+    )
+    
+    for i in range(10):
+        wandb.log({
+            "loss": 2.0 / (i + 1),
+            "accuracy": 0.7 + i * 0.03,
+            "val_loss": 2.5 / (i + 1),
+            "val_accuracy": 0.65 + i * 0.025
+        }, step=i)
+    
+    wandb.finish()
     
     # Compare experiments
-    print("\nExperiment Summary:")
-    experiments = tracker.list_experiments()
-    for exp in experiments:
-        print(f"- {exp['id']}: {exp['status']}")
+    print("\n--- Experiment Comparison ---")
+    comparer = ExperimentComparer(tracker)
     
-    # Plot metrics
-    fig = tracker.plot_metrics(exp_id, ['test_accuracy', 'test_f1'])
-    if fig:
-        fig.savefig("experiment_metrics.png")
-        print("\nSaved metrics plot")
-    
-    # MLflow-compatible API example
-    mlflow_tracker = MLflowCompatibleTracker(tracker)
-    
-    mlflow_tracker.start_run("mlflow_style_run", tags={"framework": "sklearn"})
-    mlflow_tracker.log_param("learning_rate", 0.01)
-    mlflow_tracker.log_metric("loss", 0.5, step=1)
-    mlflow_tracker.log_metric("loss", 0.3, step=2)
-    mlflow_tracker.end_run()
-    
-    print("\nExperiment tracking example completed!")
+    all_experiments = tracker.list_experiments()
+    if len(all_experiments) >= 2:
+        exp_ids = [exp['id'] for exp in all_experiments[:3]]
+        
+        comparison_df = comparer.compare_experiments(exp_ids)
+        print(comparison_df)
+        
+        # Generate report
+        comparer.generate_report(exp_ids, "experiment_report.html")
+        print("Report generated!")
 
 
 if __name__ == "__main__":

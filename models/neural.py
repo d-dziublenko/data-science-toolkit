@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Union, Any, Tuple, Callable
 import logging
+import warnings
 
 # TensorFlow/Keras imports
 try:
@@ -252,49 +253,46 @@ class DNNRegressor(NeuralNetworkBase):
         
         Args:
             X: Training features
-            y: Training target
-            validation_split: Proportion of data for validation
+            y: Training targets
+            validation_split: Fraction of data to use for validation
             epochs: Number of training epochs
             batch_size: Batch size for training
-            callbacks: List of callbacks (Keras) or None
+            callbacks: List of callbacks
             verbose: Verbosity level
         """
         # Convert to numpy arrays
         X = np.array(X)
-        y = np.array(y).reshape(-1, 1)
+        y = np.array(y)
         
         # Build model if not already built
         if self.model is None:
             self.model = self.build_model(X.shape[1])
         
         if self.framework == 'tensorflow':
-            self._fit_keras(X, y, validation_split, epochs, batch_size, callbacks, verbose)
+            # Set up callbacks
+            if callbacks is None:
+                callbacks = [
+                    EarlyStopping(patience=20, restore_best_weights=True),
+                    ReduceLROnPlateau(patience=10, factor=0.5)
+                ]
+            
+            # Train model
+            self.history = self.model.fit(
+                X, y,
+                validation_split=validation_split,
+                epochs=epochs,
+                batch_size=batch_size,
+                callbacks=callbacks,
+                verbose=verbose
+            )
         else:
-            self._fit_pytorch(X, y, validation_split, epochs, batch_size, verbose)
+            # PyTorch training
+            self._train_pytorch(X, y, validation_split, epochs, batch_size, verbose)
         
         self.is_fitted = True
     
-    def _fit_keras(self, X, y, validation_split, epochs, batch_size, callbacks, verbose):
-        """Fit Keras model."""
-        # Default callbacks
-        if callbacks is None:
-            callbacks = [
-                EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-                ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
-            ]
-        
-        # Train model
-        self.history = self.model.fit(
-            X, y,
-            validation_split=validation_split,
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=verbose
-        )
-    
-    def _fit_pytorch(self, X, y, validation_split, epochs, batch_size, verbose):
-        """Fit PyTorch model."""
+    def _train_pytorch(self, X, y, validation_split, epochs, batch_size, verbose):
+        """Train PyTorch model."""
         # Split data
         n_val = int(len(X) * validation_split)
         indices = np.random.permutation(len(X))
@@ -306,9 +304,9 @@ class DNNRegressor(NeuralNetworkBase):
         
         # Convert to tensors
         X_train = torch.FloatTensor(X_train)
-        y_train = torch.FloatTensor(y_train)
+        y_train = torch.FloatTensor(y_train.reshape(-1, 1))
         X_val = torch.FloatTensor(X_val)
-        y_val = torch.FloatTensor(y_val)
+        y_val = torch.FloatTensor(y_val.reshape(-1, 1))
         
         # Create data loaders
         train_dataset = TensorDataset(X_train, y_train)
@@ -514,16 +512,16 @@ class DNNClassifier(NeuralNetworkBase):
         if self.framework == 'tensorflow':
             if self.n_classes == 2:
                 # Binary classification
-                probs = self.model.predict(X, verbose=0)
-                predictions = (probs > 0.5).astype(int).reshape(-1)
+                probas = self.model.predict(X, verbose=0)
+                predictions = (probas > 0.5).astype(int).reshape(-1)
             else:
                 # Multi-class classification
-                probs = self.model.predict(X, verbose=0)
-                predictions = np.argmax(probs, axis=1)
+                probas = self.model.predict(X, verbose=0)
+                predictions = np.argmax(probas, axis=1)
         else:
-            raise NotImplementedError("PyTorch predictions not implemented in this example")
+            raise NotImplementedError("PyTorch prediction not implemented")
         
-        # Decode labels if needed
+        # Decode labels if encoder was used
         if self.label_encoder is not None:
             predictions = self.label_encoder.inverse_transform(predictions)
         
@@ -537,140 +535,411 @@ class DNNClassifier(NeuralNetworkBase):
         X = np.array(X)
         
         if self.framework == 'tensorflow':
-            probs = self.model.predict(X, verbose=0)
-            
+            probas = self.model.predict(X, verbose=0)
             if self.n_classes == 2:
-                # Convert single probability to two-column format
-                probs = np.column_stack([1 - probs, probs])
-            
-            return probs
+                # Convert to two-column format for binary classification
+                probas = np.hstack([1 - probas, probas])
         else:
-            raise NotImplementedError("PyTorch probability predictions not implemented")
+            raise NotImplementedError("PyTorch prediction not implemented")
+        
+        return probas
+
+
+class FeedForwardNetwork(NeuralNetworkBase):
+    """
+    General feedforward neural network with customizable architecture.
+    
+    This class provides maximum flexibility in designing feedforward networks
+    with custom layer configurations, activations, and regularization.
+    """
+    
+    def __init__(self,
+                 layer_config: List[Dict[str, Any]],
+                 task_type: str = 'regression',
+                 optimizer_config: Optional[Dict[str, Any]] = None,
+                 loss_config: Optional[Dict[str, Any]] = None,
+                 **kwargs):
+        """
+        Initialize FeedForward Network.
+        
+        Args:
+            layer_config: List of layer configurations
+            task_type: Type of task ('regression' or 'classification')
+            optimizer_config: Optimizer configuration
+            loss_config: Loss function configuration
+            **kwargs: Additional arguments for base class
+        """
+        super().__init__(task_type=task_type, **kwargs)
+        
+        self.layer_config = layer_config
+        self.optimizer_config = optimizer_config or {'type': 'adam', 'lr': 0.001}
+        self.loss_config = loss_config or {'type': 'mse' if task_type == 'regression' else 'crossentropy'}
+    
+    def _build_keras_model(self, input_shape: int, output_shape: int = 1) -> keras.Model:
+        """Build customizable Keras model."""
+        if not TENSORFLOW_AVAILABLE:
+            raise ImportError("TensorFlow is not installed")
+        
+        inputs = keras.Input(shape=(input_shape,))
+        x = inputs
+        
+        # Build layers according to configuration
+        for i, layer_conf in enumerate(self.layer_config):
+            layer_type = layer_conf.get('type', 'dense')
+            
+            if layer_type == 'dense':
+                x = layers.Dense(
+                    units=layer_conf.get('units', 64),
+                    activation=layer_conf.get('activation', 'relu'),
+                    kernel_regularizer=keras.regularizers.l2(layer_conf.get('l2_reg', 0.01)),
+                    name=f'dense_{i}'
+                )(x)
+            elif layer_type == 'dropout':
+                x = layers.Dropout(layer_conf.get('rate', 0.2), name=f'dropout_{i}')(x)
+            elif layer_type == 'batch_norm':
+                x = layers.BatchNormalization(name=f'batch_norm_{i}')(x)
+            elif layer_type == 'activation':
+                x = layers.Activation(layer_conf.get('activation', 'relu'), name=f'activation_{i}')(x)
+        
+        # Output layer
+        if self.task_type == 'regression':
+            outputs = layers.Dense(output_shape, name='output')(x)
+        else:
+            activation = 'sigmoid' if output_shape == 1 else 'softmax'
+            outputs = layers.Dense(output_shape, activation=activation, name='output')(x)
+        
+        model = keras.Model(inputs=inputs, outputs=outputs, name='feedforward_network')
+        
+        # Compile with custom optimizer and loss
+        optimizer = self._get_keras_optimizer()
+        loss = self._get_keras_loss()
+        metrics = ['mae'] if self.task_type == 'regression' else ['accuracy']
+        
+        model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+        
+        return model
+    
+    def _get_keras_optimizer(self):
+        """Get Keras optimizer from configuration."""
+        opt_type = self.optimizer_config.get('type', 'adam').lower()
+        lr = self.optimizer_config.get('lr', 0.001)
+        
+        if opt_type == 'adam':
+            return keras.optimizers.Adam(learning_rate=lr)
+        elif opt_type == 'sgd':
+            momentum = self.optimizer_config.get('momentum', 0.9)
+            return keras.optimizers.SGD(learning_rate=lr, momentum=momentum)
+        elif opt_type == 'rmsprop':
+            return keras.optimizers.RMSprop(learning_rate=lr)
+        else:
+            return keras.optimizers.Adam(learning_rate=lr)
+    
+    def _get_keras_loss(self):
+        """Get Keras loss function from configuration."""
+        loss_type = self.loss_config.get('type', 'mse').lower()
+        
+        if loss_type == 'mse':
+            return 'mse'
+        elif loss_type == 'mae':
+            return 'mae'
+        elif loss_type == 'crossentropy':
+            return 'sparse_categorical_crossentropy'
+        elif loss_type == 'binary_crossentropy':
+            return 'binary_crossentropy'
+        else:
+            return loss_type
+
+
+class ConvolutionalNetwork(NeuralNetworkBase):
+    """
+    Convolutional Neural Network for image and sequence data.
+    
+    Supports both 1D (sequences) and 2D (images) convolutions.
+    """
+    
+    def __init__(self,
+                 input_shape: Tuple[int, ...],
+                 conv_layers: List[Dict[str, Any]],
+                 dense_layers: List[int] = [128, 64],
+                 task_type: str = 'classification',
+                 n_classes: Optional[int] = None,
+                 **kwargs):
+        """
+        Initialize CNN.
+        
+        Args:
+            input_shape: Shape of input data (height, width, channels) for 2D
+                        or (sequence_length, features) for 1D
+            conv_layers: List of convolutional layer configurations
+            dense_layers: List of dense layer sizes after convolutions
+            task_type: Type of task
+            n_classes: Number of classes for classification
+            **kwargs: Additional arguments for base class
+        """
+        super().__init__(task_type=task_type, **kwargs)
+        
+        self.input_shape = input_shape
+        self.conv_layers = conv_layers
+        self.dense_layers = dense_layers
+        self.n_classes = n_classes
+    
+    def _build_keras_model(self) -> keras.Model:
+        """Build Keras CNN model."""
+        if not TENSORFLOW_AVAILABLE:
+            raise ImportError("TensorFlow is not installed")
+        
+        inputs = keras.Input(shape=self.input_shape)
+        x = inputs
+        
+        # Convolutional layers
+        for i, conv_conf in enumerate(self.conv_layers):
+            # Determine conv type (1D or 2D)
+            if len(self.input_shape) == 2:
+                # 1D convolution
+                x = layers.Conv1D(
+                    filters=conv_conf.get('filters', 32),
+                    kernel_size=conv_conf.get('kernel_size', 3),
+                    strides=conv_conf.get('strides', 1),
+                    padding=conv_conf.get('padding', 'same'),
+                    activation=conv_conf.get('activation', 'relu'),
+                    name=f'conv1d_{i}'
+                )(x)
+                
+                if conv_conf.get('pooling', True):
+                    x = layers.MaxPooling1D(
+                        pool_size=conv_conf.get('pool_size', 2),
+                        name=f'maxpool1d_{i}'
+                    )(x)
+            else:
+                # 2D convolution
+                x = layers.Conv2D(
+                    filters=conv_conf.get('filters', 32),
+                    kernel_size=conv_conf.get('kernel_size', (3, 3)),
+                    strides=conv_conf.get('strides', (1, 1)),
+                    padding=conv_conf.get('padding', 'same'),
+                    activation=conv_conf.get('activation', 'relu'),
+                    name=f'conv2d_{i}'
+                )(x)
+                
+                if conv_conf.get('pooling', True):
+                    x = layers.MaxPooling2D(
+                        pool_size=conv_conf.get('pool_size', (2, 2)),
+                        name=f'maxpool2d_{i}'
+                    )(x)
+            
+            if conv_conf.get('batch_norm', False):
+                x = layers.BatchNormalization(name=f'bn_{i}')(x)
+            
+            if conv_conf.get('dropout', 0) > 0:
+                x = layers.Dropout(conv_conf.get('dropout'), name=f'dropout_{i}')(x)
+        
+        # Flatten for dense layers
+        x = layers.Flatten(name='flatten')(x)
+        
+        # Dense layers
+        for i, units in enumerate(self.dense_layers):
+            x = layers.Dense(units, activation='relu', name=f'dense_{i}')(x)
+            x = layers.Dropout(0.2, name=f'dense_dropout_{i}')(x)
+        
+        # Output layer
+        if self.task_type == 'regression':
+            outputs = layers.Dense(1, name='output')(x)
+            loss = 'mse'
+            metrics = ['mae']
+        else:
+            if self.n_classes == 2:
+                outputs = layers.Dense(1, activation='sigmoid', name='output')(x)
+                loss = 'binary_crossentropy'
+            else:
+                outputs = layers.Dense(self.n_classes, activation='softmax', name='output')(x)
+                loss = 'sparse_categorical_crossentropy'
+            metrics = ['accuracy']
+        
+        model = keras.Model(inputs=inputs, outputs=outputs, name='convolutional_network')
+        model.compile(optimizer='adam', loss=loss, metrics=metrics)
+        
+        return model
+
+
+class RecurrentNetwork(NeuralNetworkBase):
+    """
+    Recurrent Neural Network for sequence data.
+    
+    Supports LSTM, GRU, and simple RNN architectures.
+    """
+    
+    def __init__(self,
+                 input_shape: Tuple[int, int],  # (sequence_length, features)
+                 rnn_layers: List[Dict[str, Any]],
+                 dense_layers: List[int] = [64],
+                 task_type: str = 'regression',
+                 n_classes: Optional[int] = None,
+                 **kwargs):
+        """
+        Initialize RNN.
+        
+        Args:
+            input_shape: Shape of input sequences (sequence_length, features)
+            rnn_layers: List of RNN layer configurations
+            dense_layers: List of dense layer sizes after RNN
+            task_type: Type of task
+            n_classes: Number of classes for classification
+            **kwargs: Additional arguments for base class
+        """
+        super().__init__(task_type=task_type, **kwargs)
+        
+        self.input_shape = input_shape
+        self.rnn_layers = rnn_layers
+        self.dense_layers = dense_layers
+        self.n_classes = n_classes
+    
+    def _build_keras_model(self) -> keras.Model:
+        """Build Keras RNN model."""
+        if not TENSORFLOW_AVAILABLE:
+            raise ImportError("TensorFlow is not installed")
+        
+        inputs = keras.Input(shape=self.input_shape)
+        x = inputs
+        
+        # RNN layers
+        for i, rnn_conf in enumerate(self.rnn_layers):
+            rnn_type = rnn_conf.get('type', 'lstm').lower()
+            units = rnn_conf.get('units', 64)
+            return_sequences = rnn_conf.get('return_sequences', i < len(self.rnn_layers) - 1)
+            dropout = rnn_conf.get('dropout', 0.2)
+            recurrent_dropout = rnn_conf.get('recurrent_dropout', 0.2)
+            bidirectional = rnn_conf.get('bidirectional', False)
+            
+            # Create RNN layer
+            if rnn_type == 'lstm':
+                rnn_layer = layers.LSTM(
+                    units=units,
+                    return_sequences=return_sequences,
+                    dropout=dropout,
+                    recurrent_dropout=recurrent_dropout,
+                    name=f'lstm_{i}'
+                )
+            elif rnn_type == 'gru':
+                rnn_layer = layers.GRU(
+                    units=units,
+                    return_sequences=return_sequences,
+                    dropout=dropout,
+                    recurrent_dropout=recurrent_dropout,
+                    name=f'gru_{i}'
+                )
+            else:
+                rnn_layer = layers.SimpleRNN(
+                    units=units,
+                    return_sequences=return_sequences,
+                    dropout=dropout,
+                    name=f'rnn_{i}'
+                )
+            
+            # Apply bidirectional wrapper if requested
+            if bidirectional:
+                x = layers.Bidirectional(rnn_layer, name=f'bidirectional_{i}')(x)
+            else:
+                x = rnn_layer(x)
+        
+        # Dense layers
+        for i, units in enumerate(self.dense_layers):
+            x = layers.Dense(units, activation='relu', name=f'dense_{i}')(x)
+            x = layers.Dropout(0.2, name=f'dense_dropout_{i}')(x)
+        
+        # Output layer
+        if self.task_type == 'regression':
+            outputs = layers.Dense(1, name='output')(x)
+            loss = 'mse'
+            metrics = ['mae']
+        else:
+            if self.n_classes == 2:
+                outputs = layers.Dense(1, activation='sigmoid', name='output')(x)
+                loss = 'binary_crossentropy'
+            else:
+                outputs = layers.Dense(self.n_classes, activation='softmax', name='output')(x)
+                loss = 'sparse_categorical_crossentropy'
+            metrics = ['accuracy']
+        
+        model = keras.Model(inputs=inputs, outputs=outputs, name='recurrent_network')
+        model.compile(optimizer='adam', loss=loss, metrics=metrics)
+        
+        return model
 
 
 class AutoEncoder(NeuralNetworkBase):
     """
-    Autoencoder for dimensionality reduction and anomaly detection.
+    Autoencoder for dimensionality reduction and feature learning.
     
-    This class implements a flexible autoencoder architecture that can be used
-    for feature extraction, dimensionality reduction, or anomaly detection.
+    Can be used for anomaly detection, denoising, and representation learning.
     """
     
     def __init__(self,
-                 encoding_dim: int = 32,
-                 hidden_layers: List[int] = [128, 64],
+                 input_dim: int,
+                 encoding_dims: List[int] = [128, 64, 32],
                  activation: str = 'relu',
-                 use_variational: bool = False,
+                 add_noise: bool = False,
+                 noise_factor: float = 0.1,
                  **kwargs):
         """
-        Initialize the AutoEncoder.
+        Initialize AutoEncoder.
         
         Args:
-            encoding_dim: Dimension of the encoding layer
-            hidden_layers: List of hidden layer sizes for encoder
+            input_dim: Dimensionality of input data
+            encoding_dims: List of encoding layer dimensions
             activation: Activation function
-            use_variational: Whether to use variational autoencoder
+            add_noise: Whether to add noise for denoising autoencoder
+            noise_factor: Standard deviation of Gaussian noise
             **kwargs: Additional arguments for base class
         """
         super().__init__(task_type='unsupervised', **kwargs)
         
-        self.encoding_dim = encoding_dim
-        self.hidden_layers = hidden_layers
+        self.input_dim = input_dim
+        self.encoding_dims = encoding_dims
         self.activation = activation
-        self.use_variational = use_variational
+        self.add_noise = add_noise
+        self.noise_factor = noise_factor
         self.encoder = None
         self.decoder = None
     
-    def _build_keras_model(self, input_shape: int) -> Tuple[keras.Model, keras.Model, keras.Model]:
-        """Build Keras autoencoder."""
+    def _build_keras_model(self) -> keras.Model:
+        """Build Keras autoencoder model."""
         if not TENSORFLOW_AVAILABLE:
             raise ImportError("TensorFlow is not installed")
         
         # Input
-        inputs = keras.Input(shape=(input_shape,))
+        inputs = keras.Input(shape=(self.input_dim,))
+        x = inputs
+        
+        # Add noise if denoising autoencoder
+        if self.add_noise:
+            x = layers.GaussianNoise(self.noise_factor)(x)
         
         # Encoder
-        x = inputs
-        for units in self.hidden_layers:
-            x = layers.Dense(units, activation=self.activation)(x)
+        encoded = x
+        for i, dim in enumerate(self.encoding_dims):
+            encoded = layers.Dense(dim, activation=self.activation, name=f'encoder_{i}')(encoded)
         
-        # Encoding layer
-        if self.use_variational:
-            # Variational autoencoder
-            z_mean = layers.Dense(self.encoding_dim, name='z_mean')(x)
-            z_log_var = layers.Dense(self.encoding_dim, name='z_log_var')(x)
-            
-            # Sampling layer
-            def sampling(args):
-                z_mean, z_log_var = args
-                epsilon = tf.keras.backend.random_normal(shape=tf.shape(z_mean))
-                return z_mean + tf.exp(0.5 * z_log_var) * epsilon
-            
-            encoded = layers.Lambda(sampling, name='encoded')([z_mean, z_log_var])
-        else:
-            # Standard autoencoder
-            encoded = layers.Dense(self.encoding_dim, activation=self.activation, name='encoded')(x)
-        
-        # Decoder
-        decoder_input = layers.Input(shape=(self.encoding_dim,))
-        x = decoder_input
-        
-        # Reverse the hidden layers
-        for units in reversed(self.hidden_layers):
-            x = layers.Dense(units, activation=self.activation)(x)
+        # Decoder (mirror of encoder)
+        decoded = encoded
+        for i, dim in enumerate(reversed(self.encoding_dims[:-1])):
+            decoded = layers.Dense(dim, activation=self.activation, name=f'decoder_{i}')(decoded)
         
         # Output layer
-        decoded = layers.Dense(input_shape, activation='linear')(x)
+        outputs = layers.Dense(self.input_dim, activation='sigmoid', name='output')(decoded)
         
         # Create models
-        encoder = keras.Model(inputs, encoded, name='encoder')
-        decoder = keras.Model(decoder_input, decoded, name='decoder')
-        
-        # Full autoencoder
-        autoencoder_output = decoder(encoder(inputs))
-        autoencoder = keras.Model(inputs, autoencoder_output, name='autoencoder')
+        self.encoder = keras.Model(inputs, encoded, name='encoder')
+        self.decoder = keras.Model(encoded, outputs, name='decoder')
+        autoencoder = keras.Model(inputs, outputs, name='autoencoder')
         
         # Compile
-        autoencoder.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
-            loss='mse'
-        )
+        autoencoder.compile(optimizer='adam', loss='mse', metrics=['mae'])
         
-        return autoencoder, encoder, decoder
-    
-    def fit(self, X: Union[pd.DataFrame, np.ndarray], **kwargs):
-        """Train the autoencoder."""
-        X = np.array(X)
-        
-        # Build model
-        if self.model is None:
-            if self.framework == 'tensorflow':
-                self.model, self.encoder, self.decoder = self._build_keras_model(X.shape[1])
-            else:
-                raise NotImplementedError("PyTorch autoencoder not implemented")
-        
-        # Train (using X as both input and target)
-        if self.framework == 'tensorflow':
-            # Default callbacks for autoencoder
-            callbacks = kwargs.get('callbacks', [
-                EarlyStopping(monitor='loss', patience=10, restore_best_weights=True),
-                ReduceLROnPlateau(monitor='loss', factor=0.5, patience=5)
-            ])
-            
-            self.history = self.model.fit(
-                X, X,
-                epochs=kwargs.get('epochs', 100),
-                batch_size=kwargs.get('batch_size', 32),
-                validation_split=kwargs.get('validation_split', 0.2),
-                callbacks=callbacks,
-                verbose=kwargs.get('verbose', 1)
-            )
-        
-        self.is_fitted = True
+        return autoencoder
     
     def encode(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
         """
-        Encode data to lower-dimensional representation.
+        Encode data to latent representation.
         
         Args:
             X: Data to encode
@@ -678,37 +947,15 @@ class AutoEncoder(NeuralNetworkBase):
         Returns:
             Encoded representation
         """
-        if not self.is_fitted:
+        if self.encoder is None:
             raise ValueError("Model must be fitted before encoding")
         
         X = np.array(X)
-        
-        if self.framework == 'tensorflow':
-            return self.encoder.predict(X, verbose=0)
-        else:
-            raise NotImplementedError()
-    
-    def decode(self, encoded: np.ndarray) -> np.ndarray:
-        """
-        Decode from lower-dimensional representation.
-        
-        Args:
-            encoded: Encoded data
-            
-        Returns:
-            Reconstructed data
-        """
-        if not self.is_fitted:
-            raise ValueError("Model must be fitted before decoding")
-        
-        if self.framework == 'tensorflow':
-            return self.decoder.predict(encoded, verbose=0)
-        else:
-            raise NotImplementedError()
+        return self.encoder.predict(X, verbose=0)
     
     def reconstruct(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
         """
-        Reconstruct data (encode then decode).
+        Reconstruct data from input.
         
         Args:
             X: Data to reconstruct
@@ -720,26 +967,316 @@ class AutoEncoder(NeuralNetworkBase):
             raise ValueError("Model must be fitted before reconstruction")
         
         X = np.array(X)
-        
-        if self.framework == 'tensorflow':
-            return self.model.predict(X, verbose=0)
-        else:
-            raise NotImplementedError()
+        return self.model.predict(X, verbose=0)
     
-    def compute_anomaly_scores(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+    def anomaly_score(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
         """
-        Compute anomaly scores based on reconstruction error.
+        Calculate anomaly scores based on reconstruction error.
         
         Args:
-            X: Data to compute anomaly scores for
+            X: Data to score
             
         Returns:
             Anomaly scores (higher = more anomalous)
         """
         X = np.array(X)
         reconstructed = self.reconstruct(X)
+        return np.mean((X - reconstructed) ** 2, axis=1)
+
+
+class NeuralNetworkRegressor(FeedForwardNetwork):
+    """
+    High-level neural network regressor with automatic architecture selection.
+    
+    This class provides an easy-to-use interface for regression tasks with
+    sensible defaults and automatic hyperparameter tuning capabilities.
+    """
+    
+    def __init__(self,
+                 hidden_layers: Optional[List[int]] = None,
+                 activation: str = 'relu',
+                 dropout_rate: float = 0.2,
+                 batch_norm: bool = True,
+                 learning_rate: float = 0.001,
+                 auto_architecture: bool = True,
+                 **kwargs):
+        """
+        Initialize Neural Network Regressor.
         
-        # Compute reconstruction error (MSE per sample)
-        mse = np.mean((X - reconstructed) ** 2, axis=1)
+        Args:
+            hidden_layers: List of hidden layer sizes (auto if None)
+            activation: Activation function
+            dropout_rate: Dropout rate
+            batch_norm: Whether to use batch normalization
+            learning_rate: Learning rate
+            auto_architecture: Whether to automatically determine architecture
+            **kwargs: Additional arguments
+        """
+        self.hidden_layers = hidden_layers
+        self.activation = activation
+        self.dropout_rate = dropout_rate
+        self.batch_norm = batch_norm
+        self.learning_rate = learning_rate
+        self.auto_architecture = auto_architecture
         
-        return mse
+        # Build layer configuration
+        layer_config = self._build_layer_config()
+        
+        super().__init__(
+            layer_config=layer_config,
+            task_type='regression',
+            optimizer_config={'type': 'adam', 'lr': learning_rate},
+            **kwargs
+        )
+    
+    def _build_layer_config(self) -> List[Dict[str, Any]]:
+        """Build layer configuration."""
+        if self.hidden_layers is None:
+            # Default architecture
+            self.hidden_layers = [128, 64, 32]
+        
+        config = []
+        for i, units in enumerate(self.hidden_layers):
+            # Dense layer
+            config.append({
+                'type': 'dense',
+                'units': units,
+                'activation': None,
+                'l2_reg': 0.01
+            })
+            
+            # Batch norm
+            if self.batch_norm:
+                config.append({'type': 'batch_norm'})
+            
+            # Activation
+            config.append({
+                'type': 'activation',
+                'activation': self.activation
+            })
+            
+            # Dropout
+            if self.dropout_rate > 0:
+                config.append({
+                    'type': 'dropout',
+                    'rate': self.dropout_rate
+                })
+        
+        return config
+    
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], 
+            y: Union[pd.Series, np.ndarray], **kwargs):
+        """
+        Fit the regressor with automatic architecture selection.
+        
+        Args:
+            X: Training features
+            y: Training targets
+            **kwargs: Additional arguments
+        """
+        X = np.array(X)
+        y = np.array(y)
+        
+        # Auto architecture selection based on data size
+        if self.auto_architecture and self.hidden_layers is None:
+            n_samples, n_features = X.shape
+            
+            if n_samples < 1000:
+                self.hidden_layers = [64, 32]
+            elif n_samples < 10000:
+                self.hidden_layers = [128, 64, 32]
+            else:
+                self.hidden_layers = [256, 128, 64, 32]
+            
+            # Rebuild layer config
+            self.layer_config = self._build_layer_config()
+        
+        # Build and train model
+        if self.model is None:
+            self.model = self._build_keras_model(X.shape[1], 1)
+        
+        # Set default callbacks
+        if 'callbacks' not in kwargs:
+            kwargs['callbacks'] = [
+                EarlyStopping(patience=20, restore_best_weights=True),
+                ReduceLROnPlateau(patience=10, factor=0.5, min_lr=1e-6)
+            ]
+        
+        # Train
+        self.history = self.model.fit(X, y, **kwargs)
+        self.is_fitted = True
+
+
+class NeuralNetworkClassifier(FeedForwardNetwork):
+    """
+    High-level neural network classifier with automatic architecture selection.
+    
+    This class provides an easy-to-use interface for classification tasks with
+    sensible defaults and automatic hyperparameter tuning capabilities.
+    """
+    
+    def __init__(self,
+                 hidden_layers: Optional[List[int]] = None,
+                 activation: str = 'relu',
+                 dropout_rate: float = 0.3,
+                 batch_norm: bool = True,
+                 learning_rate: float = 0.001,
+                 auto_architecture: bool = True,
+                 **kwargs):
+        """
+        Initialize Neural Network Classifier.
+        
+        Args:
+            hidden_layers: List of hidden layer sizes (auto if None)
+            activation: Activation function
+            dropout_rate: Dropout rate
+            batch_norm: Whether to use batch normalization
+            learning_rate: Learning rate
+            auto_architecture: Whether to automatically determine architecture
+            **kwargs: Additional arguments
+        """
+        self.hidden_layers = hidden_layers
+        self.activation = activation
+        self.dropout_rate = dropout_rate
+        self.batch_norm = batch_norm
+        self.learning_rate = learning_rate
+        self.auto_architecture = auto_architecture
+        self.n_classes = None
+        self.label_encoder = None
+        
+        # Build layer configuration
+        layer_config = self._build_layer_config()
+        
+        super().__init__(
+            layer_config=layer_config,
+            task_type='classification',
+            optimizer_config={'type': 'adam', 'lr': learning_rate},
+            **kwargs
+        )
+    
+    def _build_layer_config(self) -> List[Dict[str, Any]]:
+        """Build layer configuration."""
+        if self.hidden_layers is None:
+            # Default architecture
+            self.hidden_layers = [128, 64, 32]
+        
+        config = []
+        for i, units in enumerate(self.hidden_layers):
+            # Dense layer
+            config.append({
+                'type': 'dense',
+                'units': units,
+                'activation': None,
+                'l2_reg': 0.01
+            })
+            
+            # Batch norm
+            if self.batch_norm:
+                config.append({'type': 'batch_norm'})
+            
+            # Activation
+            config.append({
+                'type': 'activation',
+                'activation': self.activation
+            })
+            
+            # Dropout
+            if self.dropout_rate > 0:
+                config.append({
+                    'type': 'dropout',
+                    'rate': self.dropout_rate
+                })
+        
+        return config
+    
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], 
+            y: Union[pd.Series, np.ndarray], **kwargs):
+        """
+        Fit the classifier with automatic architecture selection.
+        
+        Args:
+            X: Training features
+            y: Training labels
+            **kwargs: Additional arguments
+        """
+        X = np.array(X)
+        y = np.array(y)
+        
+        # Encode labels if needed
+        if y.dtype == 'object':
+            from sklearn.preprocessing import LabelEncoder
+            self.label_encoder = LabelEncoder()
+            y = self.label_encoder.fit_transform(y)
+        
+        # Determine number of classes
+        self.n_classes = len(np.unique(y))
+        
+        # Auto architecture selection based on data size and classes
+        if self.auto_architecture and self.hidden_layers is None:
+            n_samples, n_features = X.shape
+            
+            if n_samples < 1000:
+                self.hidden_layers = [64, 32]
+            elif n_samples < 10000:
+                self.hidden_layers = [128, 64, 32]
+            else:
+                self.hidden_layers = [256, 128, 64, 32]
+            
+            # Add more layers for multi-class problems
+            if self.n_classes > 10:
+                self.hidden_layers.append(self.n_classes * 2)
+            
+            # Rebuild layer config
+            self.layer_config = self._build_layer_config()
+        
+        # Build and train model
+        if self.model is None:
+            output_shape = 1 if self.n_classes == 2 else self.n_classes
+            self.model = self._build_keras_model(X.shape[1], output_shape)
+        
+        # Set default callbacks
+        if 'callbacks' not in kwargs:
+            kwargs['callbacks'] = [
+                EarlyStopping(patience=20, restore_best_weights=True, monitor='val_accuracy'),
+                ReduceLROnPlateau(patience=10, factor=0.5, min_lr=1e-6, monitor='val_accuracy')
+            ]
+        
+        # Train
+        self.history = self.model.fit(X, y, **kwargs)
+        self.is_fitted = True
+    
+    def predict(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        """Make class predictions."""
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before making predictions")
+        
+        X = np.array(X)
+        
+        if self.n_classes == 2:
+            # Binary classification
+            probas = self.model.predict(X, verbose=0)
+            predictions = (probas > 0.5).astype(int).reshape(-1)
+        else:
+            # Multi-class classification
+            probas = self.model.predict(X, verbose=0)
+            predictions = np.argmax(probas, axis=1)
+        
+        # Decode labels if encoder was used
+        if self.label_encoder is not None:
+            predictions = self.label_encoder.inverse_transform(predictions)
+        
+        return predictions
+    
+    def predict_proba(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        """Get class probabilities."""
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before making predictions")
+        
+        X = np.array(X)
+        probas = self.model.predict(X, verbose=0)
+        
+        if self.n_classes == 2:
+            # Convert to two-column format for binary classification
+            probas = np.hstack([1 - probas, probas])
+        
+        return probas

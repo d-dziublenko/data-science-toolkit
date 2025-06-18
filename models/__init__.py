@@ -25,6 +25,8 @@ from .ensemble import (
 
 from .neural import (
     NeuralNetworkBase,
+    DNNRegressor,
+    DNNClassifier,
     FeedForwardNetwork,
     ConvolutionalNetwork,
     RecurrentNetwork,
@@ -39,6 +41,11 @@ from .transformers import (
     BoxCoxTransformer,
     YeoJohnsonTransformer,
     QuantileTransformer,
+    RankTransformer,
+    CompositeTransformer,
+    AutoTargetTransformer,
+    RobustTargetTransformer,
+    TargetEncoder,
     PowerTransformer
 )
 
@@ -63,6 +70,8 @@ __all__ = [
     
     # Neural networks
     'NeuralNetworkBase',
+    'DNNRegressor',
+    'DNNClassifier',
     'FeedForwardNetwork',
     'ConvolutionalNetwork',
     'RecurrentNetwork',
@@ -76,6 +85,11 @@ __all__ = [
     'BoxCoxTransformer',
     'YeoJohnsonTransformer',
     'QuantileTransformer',
+    'RankTransformer',
+    'CompositeTransformer',
+    'AutoTargetTransformer',
+    'RobustTargetTransformer',
+    'TargetEncoder',
     'PowerTransformer'
 ]
 

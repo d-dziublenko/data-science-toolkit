@@ -5,17 +5,24 @@ Inference pipeline for making predictions with trained models.
 
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Optional, Union, Tuple, Callable
+from typing import Any, Dict, List, Optional, Union, Tuple, Callable, Generator, Iterator
 from pathlib import Path
 import json
 import joblib
+import pickle
 import logging
 from datetime import datetime
 import warnings
 from dataclasses import dataclass
 from enum import Enum
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import queue
+import threading
+import time
+from tqdm import tqdm
 
-# Import from project modules
+# Import from project modules  
 from ..core.data_loader import DataLoader
 from ..core.preprocessing import DataPreprocessor
 from ..core.validation import DataValidator
@@ -51,6 +58,652 @@ class InferenceConfig:
     output_format: str = "csv"
     include_metadata: bool = True
     confidence_level: float = 0.95
+    stream_buffer_size: int = 100
+    async_max_workers: int = 4
+
+
+class BatchPredictor:
+    """
+    Batch prediction handler for processing large datasets efficiently.
+    
+    This class handles batch predictions with features like:
+    - Memory-efficient processing of large files
+    - Progress tracking
+    - Error handling and recovery
+    - Parallel processing support
+    """
+    
+    def __init__(self,
+                 model: Any,
+                 preprocessor: Optional[Any] = None,
+                 batch_size: int = 1000,
+                 n_jobs: int = 1,
+                 show_progress: bool = True):
+        """
+        Initialize BatchPredictor.
+        
+        Args:
+            model: Trained model
+            preprocessor: Data preprocessor
+            batch_size: Size of each batch
+            n_jobs: Number of parallel jobs
+            show_progress: Whether to show progress bar
+        """
+        self.model = model
+        self.preprocessor = preprocessor
+        self.batch_size = batch_size
+        self.n_jobs = n_jobs
+        self.show_progress = show_progress
+        self.stats = {
+            'total_samples': 0,
+            'processed_samples': 0,
+            'failed_samples': 0,
+            'processing_time': 0,
+            'batches_processed': 0
+        }
+    
+    def predict_file(self,
+                    file_path: Union[str, Path],
+                    output_path: Optional[Union[str, Path]] = None,
+                    file_format: str = 'auto',
+                    chunk_size: Optional[int] = None) -> pd.DataFrame:
+        """
+        Make predictions on a large file.
+        
+        Args:
+            file_path: Path to input file
+            output_path: Path to save predictions
+            file_format: File format ('csv', 'parquet', 'auto')
+            chunk_size: Size of chunks to read (for memory efficiency)
+            
+        Returns:
+            DataFrame with predictions
+        """
+        file_path = Path(file_path)
+        chunk_size = chunk_size or self.batch_size
+        
+        # Auto-detect file format
+        if file_format == 'auto':
+            file_format = file_path.suffix.lower().replace('.', '')
+        
+        logger.info(f"Processing file: {file_path} (format: {file_format})")
+        start_time = time.time()
+        
+        # Get file reader based on format
+        reader = self._get_file_reader(file_path, file_format, chunk_size)
+        
+        # Process chunks
+        all_predictions = []
+        chunk_iterator = tqdm(reader, desc="Processing chunks") if self.show_progress else reader
+        
+        for chunk_idx, chunk in enumerate(chunk_iterator):
+            try:
+                # Preprocess if needed
+                if self.preprocessor:
+                    chunk = self.preprocessor.transform(chunk)
+                
+                # Make predictions
+                chunk_predictions = self._predict_chunk(chunk)
+                
+                # Add chunk index for tracking
+                chunk_predictions['chunk_idx'] = chunk_idx
+                
+                all_predictions.append(chunk_predictions)
+                
+                # Update stats
+                self.stats['processed_samples'] += len(chunk)
+                self.stats['batches_processed'] += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing chunk {chunk_idx}: {str(e)}")
+                self.stats['failed_samples'] += len(chunk)
+                continue
+        
+        # Combine results
+        if all_predictions:
+            results = pd.concat(all_predictions, ignore_index=True)
+        else:
+            results = pd.DataFrame()
+        
+        # Update final stats
+        self.stats['processing_time'] = time.time() - start_time
+        self.stats['total_samples'] = self.stats['processed_samples'] + self.stats['failed_samples']
+        
+        # Save if output path provided
+        if output_path:
+            self._save_predictions(results, output_path, file_format)
+        
+        logger.info(f"Batch prediction complete. Processed {self.stats['processed_samples']} samples "
+                   f"in {self.stats['processing_time']:.2f} seconds")
+        
+        return results
+    
+    def predict_dataframe(self,
+                         data: pd.DataFrame,
+                         return_generator: bool = False) -> Union[pd.DataFrame, Generator]:
+        """
+        Make batch predictions on a DataFrame.
+        
+        Args:
+            data: Input DataFrame
+            return_generator: Whether to return a generator
+            
+        Returns:
+            Predictions as DataFrame or generator
+        """
+        n_samples = len(data)
+        
+        if return_generator:
+            return self._predict_generator(data)
+        
+        # Process in batches
+        all_predictions = []
+        
+        for start_idx in range(0, n_samples, self.batch_size):
+            end_idx = min(start_idx + self.batch_size, n_samples)
+            batch = data.iloc[start_idx:end_idx]
+            
+            # Preprocess if needed
+            if self.preprocessor:
+                batch = self.preprocessor.transform(batch)
+            
+            # Make predictions
+            predictions = self._predict_chunk(batch)
+            all_predictions.append(predictions)
+        
+        return pd.concat(all_predictions, ignore_index=True)
+    
+    def predict_parallel(self,
+                        data: pd.DataFrame,
+                        chunk_processor: Optional[Callable] = None) -> pd.DataFrame:
+        """
+        Make predictions using parallel processing.
+        
+        Args:
+            data: Input data
+            chunk_processor: Optional custom chunk processor
+            
+        Returns:
+            Predictions DataFrame
+        """
+        n_samples = len(data)
+        n_chunks = (n_samples + self.batch_size - 1) // self.batch_size
+        
+        # Split data into chunks
+        chunks = []
+        for i in range(n_chunks):
+            start_idx = i * self.batch_size
+            end_idx = min(start_idx + self.batch_size, n_samples)
+            chunks.append(data.iloc[start_idx:end_idx])
+        
+        # Process chunks in parallel
+        processor = chunk_processor or self._predict_chunk
+        
+        with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
+            futures = [executor.submit(processor, chunk) for chunk in chunks]
+            
+            results = []
+            for future in tqdm(futures, desc="Processing chunks") if self.show_progress else futures:
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Chunk processing failed: {str(e)}")
+        
+        return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+    
+    def _predict_chunk(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        """Predict on a single chunk."""
+        predictions = self.model.predict(chunk)
+        
+        results = pd.DataFrame({
+            'prediction': predictions,
+            'timestamp': datetime.now()
+        })
+        
+        # Add probabilities for classification
+        if hasattr(self.model, 'predict_proba'):
+            proba = self.model.predict_proba(chunk)
+            if hasattr(self.model, 'classes_'):
+                for i, class_label in enumerate(self.model.classes_):
+                    results[f'probability_{class_label}'] = proba[:, i]
+        
+        # Add input indices
+        results.index = chunk.index
+        
+        return results
+    
+    def _predict_generator(self, data: pd.DataFrame) -> Generator:
+        """Generator for memory-efficient predictions."""
+        n_samples = len(data)
+        
+        for start_idx in range(0, n_samples, self.batch_size):
+            end_idx = min(start_idx + self.batch_size, n_samples)
+            batch = data.iloc[start_idx:end_idx]
+            
+            # Preprocess if needed
+            if self.preprocessor:
+                batch = self.preprocessor.transform(batch)
+            
+            # Make predictions
+            yield self._predict_chunk(batch)
+    
+    def _get_file_reader(self, file_path: Path, file_format: str, 
+                        chunk_size: int) -> Iterator[pd.DataFrame]:
+        """Get appropriate file reader based on format."""
+        if file_format == 'csv':
+            return pd.read_csv(file_path, chunksize=chunk_size)
+        elif file_format == 'parquet':
+            # For parquet, we'll read in chunks manually
+            df = pd.read_parquet(file_path)
+            n_chunks = (len(df) + chunk_size - 1) // chunk_size
+            for i in range(n_chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size, len(df))
+                yield df.iloc[start:end]
+        elif file_format == 'json':
+            return pd.read_json(file_path, lines=True, chunksize=chunk_size)
+        else:
+            raise ValueError(f"Unsupported file format: {file_format}")
+    
+    def _save_predictions(self, predictions: pd.DataFrame, 
+                         output_path: Path, file_format: str):
+        """Save predictions to file."""
+        output_path = Path(output_path)
+        
+        if file_format == 'csv':
+            predictions.to_csv(output_path, index=False)
+        elif file_format == 'parquet':
+            predictions.to_parquet(output_path, index=False)
+        elif file_format == 'json':
+            predictions.to_json(output_path, orient='records', lines=True)
+        
+        logger.info(f"Predictions saved to {output_path}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get processing statistics."""
+        stats = self.stats.copy()
+        
+        if stats['processing_time'] > 0:
+            stats['samples_per_second'] = stats['processed_samples'] / stats['processing_time']
+        
+        return stats
+
+
+class StreamingPredictor:
+    """
+    Streaming prediction handler for real-time or continuous data streams.
+    
+    This class handles streaming predictions with features like:
+    - Real-time processing
+    - Buffering and batching
+    - Asynchronous processing
+    - Stream monitoring and metrics
+    """
+    
+    def __init__(self,
+                 model: Any,
+                 preprocessor: Optional[Any] = None,
+                 buffer_size: int = 100,
+                 batch_timeout: float = 1.0,
+                 max_workers: int = 4):
+        """
+        Initialize StreamingPredictor.
+        
+        Args:
+            model: Trained model
+            preprocessor: Data preprocessor
+            buffer_size: Size of the buffer for batching
+            batch_timeout: Maximum time to wait before processing a batch
+            max_workers: Maximum number of worker threads
+        """
+        self.model = model
+        self.preprocessor = preprocessor
+        self.buffer_size = buffer_size
+        self.batch_timeout = batch_timeout
+        self.max_workers = max_workers
+        
+        # Streaming components
+        self.buffer = queue.Queue(maxsize=buffer_size * 2)
+        self.results_queue = queue.Queue()
+        self.is_running = False
+        self.workers = []
+        
+        # Metrics
+        self.metrics = {
+            'total_processed': 0,
+            'total_failed': 0,
+            'average_latency': 0,
+            'current_buffer_size': 0,
+            'start_time': None,
+            'last_prediction_time': None
+        }
+    
+    def start(self):
+        """Start the streaming predictor."""
+        if self.is_running:
+            logger.warning("Streaming predictor is already running")
+            return
+        
+        self.is_running = True
+        self.metrics['start_time'] = datetime.now()
+        
+        # Start worker threads
+        for i in range(self.max_workers):
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name=f"StreamWorker-{i}"
+            )
+            worker.daemon = True
+            worker.start()
+            self.workers.append(worker)
+        
+        # Start batch processor
+        self.batch_processor = threading.Thread(
+            target=self._batch_processor_loop,
+            name="BatchProcessor"
+        )
+        self.batch_processor.daemon = True
+        self.batch_processor.start()
+        
+        logger.info(f"Streaming predictor started with {self.max_workers} workers")
+    
+    def stop(self):
+        """Stop the streaming predictor."""
+        if not self.is_running:
+            return
+        
+        logger.info("Stopping streaming predictor...")
+        self.is_running = False
+        
+        # Process remaining items
+        self._process_remaining()
+        
+        # Wait for threads to finish
+        for worker in self.workers:
+            worker.join(timeout=5)
+        
+        self.batch_processor.join(timeout=5)
+        
+        logger.info("Streaming predictor stopped")
+    
+    def predict(self, data: Union[Dict, pd.Series, pd.DataFrame]) -> Dict[str, Any]:
+        """
+        Make a streaming prediction.
+        
+        Args:
+            data: Input data (single sample or batch)
+            
+        Returns:
+            Prediction result
+        """
+        if not self.is_running:
+            raise RuntimeError("Streaming predictor is not running. Call start() first.")
+        
+        # Create request
+        request_id = self._generate_request_id()
+        request = {
+            'id': request_id,
+            'data': data,
+            'timestamp': datetime.now(),
+            'future': asyncio.Future() if asyncio.get_event_loop().is_running() else None
+        }
+        
+        # Add to buffer
+        self.buffer.put(request)
+        self.metrics['current_buffer_size'] = self.buffer.qsize()
+        
+        # Wait for result (blocking)
+        result = self._wait_for_result(request_id)
+        
+        return result
+    
+    async def predict_async(self, data: Union[Dict, pd.Series, pd.DataFrame]) -> Dict[str, Any]:
+        """
+        Make an asynchronous streaming prediction.
+        
+        Args:
+            data: Input data
+            
+        Returns:
+            Prediction result
+        """
+        if not self.is_running:
+            raise RuntimeError("Streaming predictor is not running. Call start() first.")
+        
+        # Create request
+        request_id = self._generate_request_id()
+        future = asyncio.Future()
+        
+        request = {
+            'id': request_id,
+            'data': data,
+            'timestamp': datetime.now(),
+            'future': future
+        }
+        
+        # Add to buffer
+        self.buffer.put(request)
+        
+        # Wait for result
+        result = await future
+        return result
+    
+    def predict_stream(self, data_stream: Iterator[Any]) -> Generator[Dict[str, Any], None, None]:
+        """
+        Process a stream of data.
+        
+        Args:
+            data_stream: Iterator of input data
+            
+        Yields:
+            Prediction results
+        """
+        if not self.is_running:
+            self.start()
+        
+        for data in data_stream:
+            result = self.predict(data)
+            yield result
+    
+    def _worker_loop(self):
+        """Worker thread loop for processing batches."""
+        while self.is_running:
+            try:
+                # Get batch from queue
+                batch = self.results_queue.get(timeout=1)
+                
+                if batch is None:  # Shutdown signal
+                    break
+                
+                # Process batch
+                self._process_batch(batch)
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Worker error: {str(e)}")
+    
+    def _batch_processor_loop(self):
+        """Batch processor loop for collecting and batching requests."""
+        batch = []
+        last_batch_time = time.time()
+        
+        while self.is_running:
+            try:
+                # Try to get item from buffer
+                timeout = max(0.1, self.batch_timeout - (time.time() - last_batch_time))
+                request = self.buffer.get(timeout=timeout)
+                batch.append(request)
+                
+                # Check if batch is ready
+                if len(batch) >= self.buffer_size or \
+                   (time.time() - last_batch_time) >= self.batch_timeout:
+                    
+                    if batch:
+                        self.results_queue.put(batch)
+                        batch = []
+                        last_batch_time = time.time()
+                
+            except queue.Empty:
+                # Timeout - process current batch if any
+                if batch and (time.time() - last_batch_time) >= self.batch_timeout:
+                    self.results_queue.put(batch)
+                    batch = []
+                    last_batch_time = time.time()
+            except Exception as e:
+                logger.error(f"Batch processor error: {str(e)}")
+    
+    def _process_batch(self, batch: List[Dict[str, Any]]):
+        """Process a batch of requests."""
+        try:
+            # Extract data
+            batch_data = []
+            for request in batch:
+                if isinstance(request['data'], dict):
+                    batch_data.append(request['data'])
+                elif isinstance(request['data'], pd.Series):
+                    batch_data.append(request['data'].to_dict())
+                else:
+                    batch_data.append(request['data'])
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(batch_data)
+            
+            # Preprocess if needed
+            if self.preprocessor:
+                df = self.preprocessor.transform(df)
+            
+            # Make predictions
+            predictions = self.model.predict(df)
+            
+            # Process results
+            for i, request in enumerate(batch):
+                result = {
+                    'id': request['id'],
+                    'prediction': predictions[i],
+                    'timestamp': datetime.now(),
+                    'latency': (datetime.now() - request['timestamp']).total_seconds()
+                }
+                
+                # Add probabilities for classification
+                if hasattr(self.model, 'predict_proba'):
+                    proba = self.model.predict_proba(df.iloc[[i]])
+                    result['probabilities'] = proba[0].tolist()
+                
+                # Complete future if async
+                if request.get('future'):
+                    request['future'].set_result(result)
+                else:
+                    # Store result for synchronous retrieval
+                    self._store_result(request['id'], result)
+                
+                # Update metrics
+                self.metrics['total_processed'] += 1
+                self.metrics['last_prediction_time'] = datetime.now()
+                self._update_latency(result['latency'])
+        
+        except Exception as e:
+            logger.error(f"Batch processing error: {str(e)}")
+            
+            # Mark all requests as failed
+            for request in batch:
+                error_result = {
+                    'id': request['id'],
+                    'error': str(e),
+                    'timestamp': datetime.now()
+                }
+                
+                if request.get('future'):
+                    request['future'].set_exception(e)
+                else:
+                    self._store_result(request['id'], error_result)
+                
+                self.metrics['total_failed'] += 1
+    
+    def _process_remaining(self):
+        """Process any remaining items in the buffer."""
+        remaining = []
+        
+        while not self.buffer.empty():
+            try:
+                remaining.append(self.buffer.get_nowait())
+            except queue.Empty:
+                break
+        
+        if remaining:
+            logger.info(f"Processing {len(remaining)} remaining items")
+            self._process_batch(remaining)
+    
+    def _generate_request_id(self) -> str:
+        """Generate unique request ID."""
+        import uuid
+        return str(uuid.uuid4())
+    
+    def _store_result(self, request_id: str, result: Dict[str, Any]):
+        """Store result for synchronous retrieval."""
+        # In a real implementation, you might use a cache or database
+        # For now, we'll use a simple in-memory dict with TTL
+        if not hasattr(self, '_results_cache'):
+            self._results_cache = {}
+        
+        self._results_cache[request_id] = result
+        
+        # Clean old results (simple TTL)
+        self._clean_results_cache()
+    
+    def _wait_for_result(self, request_id: str, timeout: float = 30) -> Dict[str, Any]:
+        """Wait for a result (blocking)."""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            if hasattr(self, '_results_cache') and request_id in self._results_cache:
+                result = self._results_cache.pop(request_id)
+                return result
+            
+            time.sleep(0.01)  # Small sleep to avoid busy waiting
+        
+        raise TimeoutError(f"Timeout waiting for result {request_id}")
+    
+    def _clean_results_cache(self):
+        """Clean old results from cache."""
+        if not hasattr(self, '_results_cache'):
+            return
+        
+        # Remove results older than 60 seconds
+        cutoff_time = datetime.now().timestamp() - 60
+        
+        to_remove = []
+        for request_id, result in self._results_cache.items():
+            if result['timestamp'].timestamp() < cutoff_time:
+                to_remove.append(request_id)
+        
+        for request_id in to_remove:
+            del self._results_cache[request_id]
+    
+    def _update_latency(self, latency: float):
+        """Update average latency metric."""
+        if self.metrics['average_latency'] == 0:
+            self.metrics['average_latency'] = latency
+        else:
+            # Exponential moving average
+            alpha = 0.1
+            self.metrics['average_latency'] = (
+                alpha * latency + (1 - alpha) * self.metrics['average_latency']
+            )
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get streaming metrics."""
+        metrics = self.metrics.copy()
+        
+        if metrics['start_time']:
+            uptime = (datetime.now() - metrics['start_time']).total_seconds()
+            metrics['uptime_seconds'] = uptime
+            
+            if uptime > 0:
+                metrics['throughput'] = metrics['total_processed'] / uptime
+        
+        return metrics
 
 
 class InferencePipeline:
@@ -77,6 +730,8 @@ class InferencePipeline:
         self.preprocessor = None
         self.uncertainty_quantifier = None
         self.drift_detector = None
+        self.batch_predictor = None
+        self.streaming_predictor = None
         
         # Load components
         self._load_components()
@@ -104,6 +759,23 @@ class InferencePipeline:
         if self.config.enable_drift_detection and self.config.drift_reference_path:
             reference_data = pd.read_csv(self.config.drift_reference_path)
             self.drift_detector = DataDriftDetector(reference_data)
+        
+        # Setup predictors based on mode
+        if self.config.prediction_mode == PredictionMode.BATCH:
+            self.batch_predictor = BatchPredictor(
+                model=self.model,
+                preprocessor=self.preprocessor,
+                batch_size=self.config.batch_size,
+                n_jobs=self.config.n_jobs
+            )
+        elif self.config.prediction_mode == PredictionMode.STREAMING:
+            self.streaming_predictor = StreamingPredictor(
+                model=self.model,
+                preprocessor=self.preprocessor,
+                buffer_size=self.config.stream_buffer_size,
+                max_workers=self.config.async_max_workers
+            )
+            self.streaming_predictor.start()
     
     def predict(self, data: Union[pd.DataFrame, np.ndarray, str, List[Dict]],
                 return_uncertainty: bool = None,
@@ -119,51 +791,76 @@ class InferencePipeline:
         Returns:
             DataFrame with predictions and optional metadata
         """
-        # Load data if path is provided
-        if isinstance(data, str):
+        # Set defaults from config
+        return_uncertainty = return_uncertainty if return_uncertainty is not None else self.config.enable_uncertainty
+        check_drift = check_drift if check_drift is not None else self.config.enable_drift_detection
+        
+        # Load data if path provided
+        if isinstance(data, (str, Path)):
             data = self._load_data(data)
         elif isinstance(data, list):
             data = pd.DataFrame(data)
         elif isinstance(data, np.ndarray):
             data = pd.DataFrame(data)
         
-        # Validate input data
+        # Validate input
         self._validate_input(data)
         
-        # Check for drift if enabled
-        if check_drift or (check_drift is None and self.config.enable_drift_detection):
-            drift_result = self._check_drift(data)
-            if drift_result and drift_result.drift_type.value != "no_drift":
-                logger.warning(f"Data drift detected: {drift_result.drift_type.value}")
-        
-        # Preprocess data
-        if self.preprocessor:
-            logger.info("Preprocessing data")
-            data_processed = self.preprocessor.transform(data)
-        else:
-            data_processed = data
+        # Check for drift
+        drift_results = None
+        if check_drift:
+            drift_results = self._check_drift(data)
+            if drift_results and drift_results.get('drift_detected'):
+                logger.warning("Data drift detected!")
         
         # Make predictions based on mode
         if self.config.prediction_mode == PredictionMode.SINGLE:
-            results = self._predict_single(data_processed)
+            predictions = self._predict_single(data)
         elif self.config.prediction_mode == PredictionMode.BATCH:
-            results = self._predict_batch(data_processed)
+            predictions = self.batch_predictor.predict_dataframe(data)
         elif self.config.prediction_mode == PredictionMode.STREAMING:
-            results = self._predict_streaming(data_processed)
+            predictions = self._predict_streaming(data)
         else:
-            results = self._predict_async(data_processed)
+            predictions = self._predict_batch(data)
         
-        # Add uncertainty if requested
-        if return_uncertainty or (return_uncertainty is None and self.config.enable_uncertainty):
-            results = self._add_uncertainty(data_processed, results)
+        # Add uncertainty estimates
+        if return_uncertainty and self.uncertainty_quantifier:
+            uncertainty = self._estimate_uncertainty(data)
+            predictions = pd.concat([predictions, uncertainty], axis=1)
         
         # Add metadata
         if self.config.include_metadata:
-            results = self._add_metadata(results, data)
+            predictions['model_version'] = getattr(self.model, 'version', 'unknown')
+            predictions['prediction_timestamp'] = datetime.now()
+            
+            if drift_results:
+                predictions['drift_detected'] = drift_results.get('drift_detected', False)
         
-        return results
+        return predictions
     
-    def _load_data(self, path: str) -> pd.DataFrame:
+    def save_predictions(self, predictions: pd.DataFrame, output_path: Union[str, Path]):
+        """
+        Save predictions to file.
+        
+        Args:
+            predictions: Predictions DataFrame
+            output_path: Path to save predictions
+        """
+        output_path = Path(output_path)
+        output_format = self.config.output_format
+        
+        if output_format == 'csv':
+            predictions.to_csv(output_path, index=False)
+        elif output_format == 'json':
+            predictions.to_json(output_path, orient='records', indent=2)
+        elif output_format == 'parquet':
+            predictions.to_parquet(output_path, index=False)
+        else:
+            raise ValueError(f"Unknown output format: {output_format}")
+        
+        logger.info(f"Predictions saved to {output_path}")
+    
+    def _load_data(self, path: Union[str, Path]) -> pd.DataFrame:
         """Load data from file."""
         file_handler = FileHandler()
         return file_handler.read(path)
@@ -232,126 +929,55 @@ class InferencePipeline:
         return pd.concat(all_results, ignore_index=True)
     
     def _predict_streaming(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Make streaming predictions (generator-based)."""
-        # For streaming, we process one sample at a time
+        """Make streaming predictions."""
+        # For DataFrame input, process row by row through streaming predictor
         results = []
         
         for idx, row in data.iterrows():
-            row_df = pd.DataFrame([row])
-            pred = self._predict_single(row_df)
-            results.append(pred)
-            
-            # Yield intermediate results (useful for real streaming)
-            if len(results) % 100 == 0:
-                logger.debug(f"Processed {len(results)} samples")
+            result = self.streaming_predictor.predict(row.to_dict())
+            results.append(result)
         
-        return pd.concat(results, ignore_index=True)
+        # Convert results to DataFrame
+        predictions_data = []
+        for result in results:
+            pred_dict = {
+                'prediction': result['prediction']
+            }
+            if 'probabilities' in result:
+                for i, prob in enumerate(result['probabilities']):
+                    pred_dict[f'probability_class_{i}'] = prob
+            predictions_data.append(pred_dict)
+        
+        return pd.DataFrame(predictions_data)
     
-    def _predict_async(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Make predictions asynchronously using parallel processing."""
-        processor = ParallelProcessor(n_jobs=self.config.n_jobs)
+    def _estimate_uncertainty(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Estimate prediction uncertainty."""
+        # This is a simplified version - you'd implement the actual uncertainty methods
+        logger.info(f"Estimating uncertainty using {self.config.uncertainty_method}")
         
-        # Split data into chunks
-        chunks = np.array_split(data, self.config.n_jobs)
-        
-        # Process in parallel
-        results = processor.map(self._predict_single, chunks)
-        
-        return pd.concat(results, ignore_index=True)
-    
-    def _add_uncertainty(self, data: pd.DataFrame, results: pd.DataFrame) -> pd.DataFrame:
-        """Add uncertainty estimates to predictions."""
-        if not self.uncertainty_quantifier:
-            return results
-        
-        logger.info("Computing uncertainty estimates")
-        
-        # Get training data if available (for residual methods)
-        train_data = None
-        train_target = None
-        if hasattr(self.model, 'training_data_'):
-            train_data = self.model.training_data_['X']
-            train_target = self.model.training_data_['y']
-        
-        # Compute uncertainty based on method
         if self.config.uncertainty_method == "bootstrap":
-            if train_data is not None:
-                uncertainty_results = self.uncertainty_quantifier.bootstrap_uncertainty(
-                    self.model, train_data, train_target, data,
-                    n_bootstrap=50,
-                    confidence_level=self.config.confidence_level
-                )
-            else:
-                logger.warning("Bootstrap uncertainty requires training data")
-                return results
-                
-        elif self.config.uncertainty_method == "ensemble" and hasattr(self.model, 'estimators_'):
-            # For ensemble models
-            uncertainty_results = self.uncertainty_quantifier.ensemble_uncertainty(
-                self.model.estimators_, data,
-                confidence_level=self.config.confidence_level
-            )
-        else:
-            logger.warning(f"Uncertainty method {self.config.uncertainty_method} not available")
-            return results
-        
-        # Add uncertainty to results
-        if 'lower_bound' in uncertainty_results:
-            results['prediction_lower'] = uncertainty_results['lower_bound']
-            results['prediction_upper'] = uncertainty_results['upper_bound']
-        
-        if 'std' in uncertainty_results:
-            results['prediction_std'] = uncertainty_results['std']
-        
-        return results
-    
-    def _add_metadata(self, results: pd.DataFrame, original_data: pd.DataFrame) -> pd.DataFrame:
-        """Add metadata to predictions."""
-        metadata = {
-            'prediction_timestamp': datetime.now().isoformat(),
-            'model_version': getattr(self.model, 'version', 'unknown'),
-            'pipeline_version': '1.0.0'
-        }
-        
-        for key, value in metadata.items():
-            results[key] = value
-        
-        # Add row identifiers if available
-        if 'id' in original_data.columns:
-            results['id'] = original_data['id'].values
-        
-        return results
-    
-    def predict_proba(self, data: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
-        """
-        Get probability predictions for classification models.
-        
-        Args:
-            data: Input data
+            # Simplified bootstrap uncertainty
+            n_iterations = 100
+            predictions = []
             
-        Returns:
-            Probability array
-        """
-        if not hasattr(self.model, 'predict_proba'):
-            raise ValueError("Model does not support probability predictions")
+            for _ in range(n_iterations):
+                # In practice, you'd retrain on bootstrap samples
+                pred = self.model.predict(data)
+                predictions.append(pred)
+            
+            predictions = np.array(predictions)
+            
+            uncertainty_df = pd.DataFrame({
+                'prediction_std': np.std(predictions, axis=0),
+                'prediction_lower': np.percentile(predictions, 2.5, axis=0),
+                'prediction_upper': np.percentile(predictions, 97.5, axis=0)
+            })
+            
+            return uncertainty_df
         
-        # Preprocess if needed
-        if self.preprocessor:
-            data = self.preprocessor.transform(data)
-        
-        return self.model.predict_proba(data)
-    
-    def save_predictions(self, predictions: pd.DataFrame, output_path: str):
-        """
-        Save predictions to file.
-        
-        Args:
-            predictions: Predictions DataFrame
-            output_path: Output file path
-        """
-        file_handler = FileHandler()
-        file_handler.write(predictions, output_path, format=self.config.output_format)
-        logger.info(f"Saved predictions to {output_path}")
+        else:
+            # Placeholder for other methods
+            return pd.DataFrame()
     
     def explain_predictions(self, data: pd.DataFrame, 
                           method: str = "shap") -> pd.DataFrame:
@@ -365,21 +991,20 @@ class InferencePipeline:
         Returns:
             DataFrame with explanations
         """
-        logger.info(f"Generating {method} explanations")
+        logger.info(f"Generating explanations using {method}")
         
         if method == "shap":
             try:
                 import shap
                 
                 # Create explainer
-                explainer = shap.TreeExplainer(self.model)
-                shap_values = explainer.shap_values(data)
+                explainer = shap.Explainer(self.model, data)
+                shap_values = explainer(data)
                 
                 # Convert to DataFrame
-                feature_names = data.columns
                 explanations = pd.DataFrame(
-                    shap_values,
-                    columns=[f"shap_{col}" for col in feature_names]
+                    shap_values.values,
+                    columns=[f"shap_{col}" for col in data.columns]
                 )
                 
                 return explanations
@@ -462,6 +1087,11 @@ class InferencePipeline:
         logger.info(f"Benchmark results: {metrics['samples_per_second']:.2f} samples/second")
         
         return metrics
+    
+    def __del__(self):
+        """Cleanup when pipeline is destroyed."""
+        if hasattr(self, 'streaming_predictor') and self.streaming_predictor:
+            self.streaming_predictor.stop()
 
 
 class ModelServer:
@@ -552,7 +1182,7 @@ def batch_predict(model_path: str, data_path: str, output_path: str,
     
     Args:
         model_path: Path to model
-        data_path: Path to input data
+        data_path: Path to input data  
         output_path: Path to save predictions
         batch_size: Batch size
         **kwargs: Additional options
@@ -605,7 +1235,7 @@ def example_inference():
         pipeline = create_inference_pipeline(
             str(model_path),
             enable_uncertainty=True,
-            uncertainty_method="ensemble",
+            uncertainty_method="bootstrap",
             include_metadata=True
         )
         
@@ -623,6 +1253,29 @@ def example_inference():
         print("\nBenchmarking...")
         metrics = pipeline.benchmark(test_df, n_runs=5)
         print(f"Performance: {metrics['samples_per_second']:.2f} samples/second")
+        
+        # Test batch predictor
+        print("\nTesting batch predictor...")
+        batch_predictor = BatchPredictor(model, batch_size=50)
+        batch_results = batch_predictor.predict_file(
+            test_data_path,
+            output_path=Path(tmpdir) / "batch_predictions.csv"
+        )
+        print(f"Batch predictor stats: {batch_predictor.get_stats()}")
+        
+        # Test streaming predictor
+        print("\nTesting streaming predictor...")
+        streaming_predictor = StreamingPredictor(model)
+        streaming_predictor.start()
+        
+        # Simulate streaming predictions
+        for i in range(5):
+            sample = test_df.iloc[i].to_dict()
+            result = streaming_predictor.predict(sample)
+            print(f"Stream prediction {i}: {result['prediction']}")
+        
+        print(f"Streaming metrics: {streaming_predictor.get_metrics()}")
+        streaming_predictor.stop()
         
         # Test model server
         print("\nTesting model server...")

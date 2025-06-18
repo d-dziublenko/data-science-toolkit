@@ -89,6 +89,317 @@ def setup_logging(level: str = 'INFO',
         root_logger.addHandler(file_handler)
 
 
+class CLIParser:
+    """
+    Enhanced argument parser with validation and config file support.
+    """
+    
+    def __init__(self, prog: str = None, description: str = None):
+        """
+        Initialize CLI parser.
+        
+        Args:
+            prog: Program name
+            description: Program description
+        """
+        self.parser = argparse.ArgumentParser(prog=prog, description=description)
+        self.validators = {}
+        self._setup_default_args()
+    
+    def _setup_default_args(self):
+        """Setup default arguments."""
+        self.parser.add_argument(
+            '--config', '-c',
+            type=str,
+            help='Configuration file (JSON/YAML)'
+        )
+        self.parser.add_argument(
+            '--verbose', '-v',
+            action='store_true',
+            help='Enable verbose output'
+        )
+        self.parser.add_argument(
+            '--quiet', '-q',
+            action='store_true',
+            help='Suppress all output except errors'
+        )
+    
+    def add_argument(self, *args, validator: Callable = None, **kwargs):
+        """
+        Add argument with optional validator.
+        
+        Args:
+            *args: Positional arguments for argparse
+            validator: Optional validation function
+            **kwargs: Keyword arguments for argparse
+        """
+        action = self.parser.add_argument(*args, **kwargs)
+        if validator:
+            self.validators[action.dest] = validator
+        return action
+    
+    def parse_args(self, args: Optional[List[str]] = None) -> argparse.Namespace:
+        """
+        Parse and validate arguments.
+        
+        Args:
+            args: Optional argument list
+            
+        Returns:
+            Parsed arguments
+        """
+        parsed_args = self.parser.parse_args(args)
+        
+        # Load config if specified
+        if hasattr(parsed_args, 'config') and parsed_args.config:
+            self._load_config(parsed_args)
+        
+        # Validate arguments
+        self._validate_args(parsed_args)
+        
+        return parsed_args
+    
+    def _load_config(self, args: argparse.Namespace):
+        """Load configuration from file."""
+        config_path = Path(args.config)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        with open(config_path) as f:
+            if config_path.suffix in ['.yaml', '.yml']:
+                config = yaml.safe_load(f)
+            elif config_path.suffix == '.json':
+                config = json.load(f)
+            else:
+                raise ValueError(f"Unsupported config format: {config_path.suffix}")
+        
+        # Update args with config values
+        for key, value in config.items():
+            if hasattr(args, key) and getattr(args, key) is None:
+                setattr(args, key, value)
+    
+    def _validate_args(self, args: argparse.Namespace):
+        """Validate parsed arguments."""
+        for dest, validator in self.validators.items():
+            if hasattr(args, dest):
+                value = getattr(args, dest)
+                if not validator(value):
+                    raise ValueError(f"Validation failed for {dest}: {value}")
+
+
+class CommandHandler:
+    """
+    Handler for CLI commands with subcommands support.
+    """
+    
+    def __init__(self, name: str, description: str = None):
+        """
+        Initialize command handler.
+        
+        Args:
+            name: Command name
+            description: Command description
+        """
+        self.name = name
+        self.description = description
+        self.subcommands = {}
+        self.parser = argparse.ArgumentParser(prog=name, description=description)
+        self.subparsers = self.parser.add_subparsers(dest='command', help='Available commands')
+    
+    def add_command(self, name: str, handler: Callable, description: str = None):
+        """
+        Add a subcommand.
+        
+        Args:
+            name: Subcommand name
+            handler: Function to handle the command
+            description: Command description
+        """
+        # Create subparser
+        subparser = self.subparsers.add_parser(name, help=description)
+        
+        # Extract arguments from handler signature
+        import inspect
+        sig = inspect.signature(handler)
+        for param_name, param in sig.parameters.items():
+            if param_name == 'self':
+                continue
+            
+            # Determine argument type
+            arg_type = str
+            if param.annotation != inspect.Parameter.empty:
+                arg_type = param.annotation
+            
+            # Add argument
+            if param.default == inspect.Parameter.empty:
+                subparser.add_argument(param_name, type=arg_type)
+            else:
+                subparser.add_argument(f'--{param_name}', type=arg_type, 
+                                     default=param.default)
+        
+        self.subcommands[name] = handler
+    
+    def execute(self, args: Optional[List[str]] = None):
+        """
+        Execute command based on arguments.
+        
+        Args:
+            args: Optional argument list
+        """
+        parsed_args = self.parser.parse_args(args)
+        
+        if not parsed_args.command:
+            self.parser.print_help()
+            return
+        
+        # Get handler
+        handler = self.subcommands.get(parsed_args.command)
+        if not handler:
+            print_error(f"Unknown command: {parsed_args.command}")
+            return
+        
+        # Prepare kwargs
+        kwargs = vars(parsed_args)
+        kwargs.pop('command')
+        
+        # Execute handler
+        try:
+            handler(**kwargs)
+        except Exception as e:
+            print_error(f"Command failed: {e}")
+            if parsed_args.verbose if hasattr(parsed_args, 'verbose') else False:
+                import traceback
+                traceback.print_exc()
+
+
+class ArgumentValidator:
+    """
+    Collection of argument validators.
+    """
+    
+    @staticmethod
+    def file_exists(path: str) -> bool:
+        """Validate that file exists."""
+        return Path(path).exists()
+    
+    @staticmethod
+    def dir_exists(path: str) -> bool:
+        """Validate that directory exists."""
+        return Path(path).is_dir()
+    
+    @staticmethod
+    def positive_int(value: Union[str, int]) -> bool:
+        """Validate positive integer."""
+        try:
+            return int(value) > 0
+        except (ValueError, TypeError):
+            return False
+    
+    @staticmethod
+    def positive_float(value: Union[str, float]) -> bool:
+        """Validate positive float."""
+        try:
+            return float(value) > 0
+        except (ValueError, TypeError):
+            return False
+    
+    @staticmethod
+    def in_range(min_val: float, max_val: float) -> Callable:
+        """Create range validator."""
+        def validator(value: Union[str, float]) -> bool:
+            try:
+                val = float(value)
+                return min_val <= val <= max_val
+            except (ValueError, TypeError):
+                return False
+        return validator
+    
+    @staticmethod
+    def choices(valid_choices: List[Any]) -> Callable:
+        """Create choices validator."""
+        def validator(value: Any) -> bool:
+            return value in valid_choices
+        return validator
+    
+    @staticmethod
+    def regex(pattern: str) -> Callable:
+        """Create regex validator."""
+        import re
+        compiled = re.compile(pattern)
+        
+        def validator(value: str) -> bool:
+            return bool(compiled.match(str(value)))
+        return validator
+
+
+def create_cli_app(name: str, version: str = "1.0.0", 
+                   description: str = None) -> 'CLIApplication':
+    """
+    Factory function to create CLI application.
+    
+    Args:
+        name: Application name
+        version: Application version
+        description: Application description
+        
+    Returns:
+        CLIApplication instance
+    """
+    app = CLIApplication(name, version)
+    if description:
+        app.description = description
+    return app
+
+
+def run_command(command: Callable, args: Optional[List[str]] = None,
+                catch_errors: bool = True) -> int:
+    """
+    Run a command function with error handling.
+    
+    Args:
+        command: Command function to run
+        args: Optional arguments
+        catch_errors: Whether to catch and handle errors
+        
+    Returns:
+        Exit code (0 for success, non-zero for error)
+    """
+    try:
+        # Parse function signature
+        import inspect
+        sig = inspect.signature(command)
+        
+        # Create parser
+        parser = argparse.ArgumentParser(description=command.__doc__)
+        
+        # Add arguments from signature
+        for param_name, param in sig.parameters.items():
+            arg_type = str
+            if param.annotation != inspect.Parameter.empty:
+                arg_type = param.annotation
+            
+            if param.default == inspect.Parameter.empty:
+                parser.add_argument(param_name, type=arg_type)
+            else:
+                parser.add_argument(f'--{param_name}', type=arg_type,
+                                  default=param.default)
+        
+        # Parse arguments
+        parsed_args = parser.parse_args(args)
+        
+        # Execute command
+        result = command(**vars(parsed_args))
+        
+        return 0 if result is None else result
+        
+    except Exception as e:
+        if catch_errors:
+            print_error(str(e))
+            return 1
+        else:
+            raise
+
+
 class ConfigArgumentParser:
     """
     Argument parser that supports loading from config files.
@@ -187,173 +498,26 @@ class ProgressBar:
     def _render(self):
         """Render progress bar."""
         if self.style == 'bar':
-            self._render_bar()
+            progress = self.current / self.total
+            filled = int(progress * self.width)
+            bar = '█' * filled + '░' * (self.width - filled)
+            percent = progress * 100
+            print(f'\r{self.description}: [{bar}] {percent:.1f}%', end='', flush=True)
         elif self.style == 'dots':
-            self._render_dots()
+            dots = '.' * (self.current % 4)
+            print(f'\r{self.description}{dots:<4}', end='', flush=True)
         elif self.style == 'spinner':
-            self._render_spinner()
-    
-    def _render_bar(self):
-        """Render bar-style progress."""
-        progress = self.current / self.total
-        filled = int(self.width * progress)
-        
-        bar = f"{'█' * filled}{'░' * (self.width - filled)}"
-        percentage = f"{progress * 100:.1f}%"
-        
-        print(f"\r{self.description}: |{bar}| {percentage} [{self.current}/{self.total}]", 
-              end='', flush=True)
-        
-        if self.current >= self.total:
-            print()  # New line at completion
-    
-    def _render_dots(self):
-        """Render dots-style progress."""
-        dots = '.' * (self.current % 4)
-        print(f"\r{self.description}{dots}   [{self.current}/{self.total}]", 
-              end='', flush=True)
-        
-        if self.current >= self.total:
-            print()
-    
-    def _render_spinner(self):
-        """Render spinner-style progress."""
-        spinner = self._spinner_chars[self._spinner_idx % len(self._spinner_chars)]
-        self._spinner_idx += 1
-        
-        print(f"\r{spinner} {self.description} [{self.current}/{self.total}]", 
-              end='', flush=True)
-        
-        if self.current >= self.total:
-            print()
+            self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_chars)
+            spinner = self._spinner_chars[self._spinner_idx]
+            percent = (self.current / self.total) * 100
+            print(f'\r{spinner} {self.description}: {percent:.1f}%', end='', flush=True)
     
     def close(self):
         """Close progress bar."""
-        if self.current < self.total:
-            self.current = self.total
-            self._render()
-
-
-def confirm_action(message: str, default: bool = False) -> bool:
-    """
-    Ask for user confirmation.
-    
-    Args:
-        message: Confirmation message
-        default: Default response
-        
-    Returns:
-        User response
-    """
-    suffix = " [Y/n]" if default else " [y/N]"
-    
-    while True:
-        response = input(f"{message}{suffix}: ").strip().lower()
-        
-        if not response:
-            return default
-        elif response in ['y', 'yes']:
-            return True
-        elif response in ['n', 'no']:
-            return False
+        if self.style == 'bar':
+            print(f'\r{self.description}: [{"█" * self.width}] 100.0%')
         else:
-            print("Please answer 'yes' or 'no'")
-
-
-def select_option(options: List[str], prompt: str = "Select an option:") -> str:
-    """
-    Interactive option selection.
-    
-    Args:
-        options: List of options
-        prompt: Selection prompt
-        
-    Returns:
-        Selected option
-    """
-    print(f"\n{prompt}")
-    for i, option in enumerate(options, 1):
-        print(f"  {i}. {option}")
-    
-    while True:
-        try:
-            choice = input("\nEnter your choice (number): ").strip()
-            idx = int(choice) - 1
-            
-            if 0 <= idx < len(options):
-                return options[idx]
-            else:
-                print(f"Please enter a number between 1 and {len(options)}")
-        except ValueError:
-            print("Please enter a valid number")
-
-
-def print_table(data: List[Dict[str, Any]], 
-                headers: Optional[List[str]] = None,
-                max_width: Optional[int] = None) -> None:
-    """
-    Print data as a formatted table.
-    
-    Args:
-        data: List of dictionaries
-        headers: Optional custom headers
-        max_width: Maximum column width
-    """
-    if not data:
-        print("No data to display")
-        return
-    
-    # Get headers
-    if headers is None:
-        headers = list(data[0].keys())
-    
-    # Calculate column widths
-    widths = {}
-    for header in headers:
-        max_len = len(str(header))
-        for row in data:
-            value = str(row.get(header, ''))
-            if max_width and len(value) > max_width:
-                value = value[:max_width-3] + '...'
-            max_len = max(max_len, len(value))
-        widths[header] = max_len
-    
-    # Print header
-    header_line = " | ".join(f"{h:<{widths[h]}}" for h in headers)
-    print(header_line)
-    print("-" * len(header_line))
-    
-    # Print data
-    for row in data:
-        values = []
-        for header in headers:
-            value = str(row.get(header, ''))
-            if max_width and len(value) > max_width:
-                value = value[:max_width-3] + '...'
-            values.append(f"{value:<{widths[header]}}")
-        print(" | ".join(values))
-
-
-def print_summary(title: str, data: Dict[str, Any], 
-                 color: str = 'GREEN') -> None:
-    """
-    Print a formatted summary.
-    
-    Args:
-        title: Summary title
-        data: Summary data
-        color: Title color
-    """
-    color_code = getattr(Fore, color.upper(), Fore.GREEN)
-    
-    print(f"\n{color_code}{'=' * 50}")
-    print(f"{title:^50}")
-    print(f"{'=' * 50}{Style.RESET_ALL}")
-    
-    for key, value in data.items():
-        print(f"{key:.<30} {value}")
-    
-    print(f"{color_code}{'=' * 50}{Style.RESET_ALL}\n")
+            print(f'\r✓ {self.description}')
 
 
 class CLIApplication:
@@ -372,6 +536,7 @@ class CLIApplication:
         self.name = name
         self.version = version
         self.commands = {}
+        self.description = None
     
     def command(self, name: str = None):
         """
@@ -507,6 +672,131 @@ def spinner(text: str = "Processing..."):
             print(f'\r✓ {self.text}')
     
     return Spinner(text)
+
+
+def confirm(prompt: str = "Continue?", default: bool = True) -> bool:
+    """
+    Ask for user confirmation.
+    
+    Args:
+        prompt: Confirmation prompt
+        default: Default value if user presses enter
+        
+    Returns:
+        User's choice
+    """
+    if default:
+        prompt += " [Y/n]: "
+    else:
+        prompt += " [y/N]: "
+    
+    while True:
+        choice = input(prompt).strip().lower()
+        
+        if not choice:
+            return default
+        elif choice in ['y', 'yes']:
+            return True
+        elif choice in ['n', 'no']:
+            return False
+        else:
+            print("Please enter 'y' or 'n'")
+
+
+def prompt_choice(options: List[str], prompt: str = "Select an option:") -> str:
+    """
+    Prompt user to select from options.
+    
+    Args:
+        options: List of options
+        prompt: Selection prompt
+        
+    Returns:
+        Selected option
+    """
+    print(f"\n{prompt}")
+    for i, option in enumerate(options, 1):
+        print(f"  {i}. {option}")
+    
+    while True:
+        try:
+            choice = input("\nEnter your choice (number): ").strip()
+            idx = int(choice) - 1
+            
+            if 0 <= idx < len(options):
+                return options[idx]
+            else:
+                print(f"Please enter a number between 1 and {len(options)}")
+        except ValueError:
+            print("Please enter a valid number")
+
+
+def print_table(data: List[Dict[str, Any]], 
+                headers: Optional[List[str]] = None,
+                max_width: Optional[int] = None) -> None:
+    """
+    Print data as a formatted table.
+    
+    Args:
+        data: List of dictionaries
+        headers: Optional custom headers
+        max_width: Maximum column width
+    """
+    if not data:
+        print("No data to display")
+        return
+    
+    # Get headers
+    if headers is None:
+        headers = list(data[0].keys())
+    
+    # Calculate column widths
+    widths = {}
+    for header in headers:
+        max_len = len(str(header))
+        for row in data:
+            value = str(row.get(header, ''))
+            if max_width and len(value) > max_width:
+                value = value[:max_width-3] + '...'
+            max_len = max(max_len, len(value))
+        widths[header] = max_len
+    
+    # Print header
+    header_line = " | ".join(f"{h:<{widths[h]}}" for h in headers)
+    print(header_line)
+    print("-" * len(header_line))
+    
+    # Print data
+    for row in data:
+        values = []
+        for header in headers:
+            value = str(row.get(header, ''))
+            if max_width and len(value) > max_width:
+                value = value[:max_width-3] + '...'
+            values.append(f"{value:<{widths[header]}}")
+        print(" | ".join(values))
+
+
+def print_summary(title: str, data: Dict[str, Any], 
+                 color: str = 'GREEN') -> None:
+    """
+    Print a formatted summary.
+    
+    Args:
+        title: Summary title
+        data: Summary data
+        color: Title color
+    """
+    color_code = getattr(Fore, color.upper(), Fore.GREEN)
+    
+    print(f"\n{color_code}{'=' * 50}")
+    print(f"{title:^50}")
+    print(f"{'=' * 50}{Style.RESET_ALL}")
+    
+    for key, value in data.items():
+        print(f"{key:.<30} {value}")
+    
+    print(f"{color_code}{'=' * 50}{Style.RESET_ALL}\n")
 
 
 def create_cli_command(func: Callable) -> click.Command:

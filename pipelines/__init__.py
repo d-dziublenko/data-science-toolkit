@@ -25,9 +25,14 @@ from .experiment import (
     ExperimentTracker,
     ExperimentConfig,
     ExperimentStatus,
+    ExperimentContext,
     MLFlowTracker,
+    MLFlowRun,
     WandbTracker,
-    ExperimentComparer
+    WandbRun,
+    WandbArtifact,
+    ExperimentComparer,
+    MLflowCompatibleTracker
 )
 
 __all__ = [
@@ -51,9 +56,14 @@ __all__ = [
     'ExperimentTracker',
     'ExperimentConfig',
     'ExperimentStatus',
+    'ExperimentContext',
     'MLFlowTracker',
+    'MLFlowRun',
     'WandbTracker',
-    'ExperimentComparer'
+    'WandbRun',
+    'WandbArtifact',
+    'ExperimentComparer',
+    'MLflowCompatibleTracker'
 ]
 
 __version__ = '1.0.0'

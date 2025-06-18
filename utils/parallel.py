@@ -5,10 +5,10 @@ Parallel processing utilities for the data science toolkit.
 
 import os
 import multiprocessing as mp
-from multiprocessing import Pool, Process, Queue, Manager
+from multiprocessing import Pool, Process, Queue, Manager, Value, Array
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
-from typing import Any, Callable, Dict, List, Optional, Union, Tuple, Iterable
+from typing import Any, Callable, Dict, List, Optional, Union, Tuple, Iterable, TypeVar
 import numpy as np
 import pandas as pd
 from functools import partial, wraps
@@ -17,8 +17,122 @@ import logging
 import time
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass, field
+import pickle
+import queue
+import asyncio
+from enum import Enum
+import socket
+import json
+import dask
+import ray
+import joblib
+from collections import defaultdict
+
+try:
+    import dask.dataframe as dd
+    import dask.array as da
+    from dask.distributed import Client, as_completed as dask_as_completed
+    DASK_AVAILABLE = True
+except ImportError:
+    DASK_AVAILABLE = False
+
+try:
+    import ray
+    RAY_AVAILABLE = True
+except ImportError:
+    RAY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
+
+
+class BackendType(Enum):
+    """Supported parallel processing backends."""
+    MULTIPROCESSING = "multiprocessing"
+    THREADING = "threading"
+    DASK = "dask"
+    RAY = "ray"
+    JOBLIB = "joblib"
+    ASYNCIO = "asyncio"
+
+
+@dataclass
+class ParallelConfig:
+    """
+    Configuration for parallel processing.
+    
+    This class holds all configuration parameters for parallel execution,
+    making it easy to manage and reuse configurations.
+    """
+    n_jobs: int = -1
+    backend: Union[str, BackendType] = BackendType.MULTIPROCESSING
+    chunk_size: Optional[int] = None
+    batch_size: int = 1000
+    verbose: bool = True
+    show_progress: bool = True
+    timeout: Optional[float] = None
+    memory_limit: Optional[str] = None  # e.g., "4GB"
+    
+    # Backend-specific configurations
+    multiprocessing_context: str = "spawn"  # spawn, fork, forkserver
+    thread_name_prefix: str = "Worker"
+    
+    # Dask-specific
+    dask_scheduler: str = "threads"  # threads, processes, synchronous
+    dask_dashboard_address: Optional[str] = ":8787"
+    dask_n_workers: Optional[int] = None
+    dask_threads_per_worker: Optional[int] = None
+    
+    # Ray-specific
+    ray_address: Optional[str] = None  # Ray cluster address
+    ray_num_cpus: Optional[int] = None
+    ray_num_gpus: Optional[int] = None
+    ray_object_store_memory: Optional[int] = None
+    
+    # Error handling
+    retry_failed: bool = True
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    ignore_errors: bool = False
+    
+    # Resource management
+    max_memory_per_worker: Optional[str] = None
+    cpu_affinity: Optional[List[int]] = None
+    
+    def __post_init__(self):
+        """Validate and process configuration."""
+        self.n_jobs = get_n_jobs(self.n_jobs)
+        
+        if isinstance(self.backend, str):
+            try:
+                self.backend = BackendType(self.backend.lower())
+            except ValueError:
+                raise ValueError(f"Unsupported backend: {self.backend}")
+        
+        # Validate backend availability
+        if self.backend == BackendType.DASK and not DASK_AVAILABLE:
+            warnings.warn("Dask not available, falling back to multiprocessing")
+            self.backend = BackendType.MULTIPROCESSING
+        elif self.backend == BackendType.RAY and not RAY_AVAILABLE:
+            warnings.warn("Ray not available, falling back to multiprocessing")
+            self.backend = BackendType.MULTIPROCESSING
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary."""
+        config_dict = {}
+        for field_name in self.__dataclass_fields__:
+            value = getattr(self, field_name)
+            if isinstance(value, Enum):
+                value = value.value
+            config_dict[field_name] = value
+        return config_dict
+    
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'ParallelConfig':
+        """Create configuration from dictionary."""
+        return cls(**config_dict)
 
 
 def get_n_jobs(n_jobs: int = -1) -> int:
@@ -50,20 +164,85 @@ class ParallelProcessor:
     
     def __init__(self, n_jobs: int = -1, 
                  backend: str = 'multiprocessing',
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 config: Optional[ParallelConfig] = None):
         """
         Initialize the parallel processor.
         
         Args:
             n_jobs: Number of parallel jobs
-            backend: Backend to use ('multiprocessing', 'threading', 'dask')
+            backend: Backend to use
             verbose: Whether to show progress
+            config: Full configuration (overrides other parameters)
         """
-        self.n_jobs = get_n_jobs(n_jobs)
-        self.backend = backend
-        self.verbose = verbose
+        if config is None:
+            self.config = ParallelConfig(
+                n_jobs=n_jobs,
+                backend=backend,
+                verbose=verbose
+            )
+        else:
+            self.config = config
         
-        logger.info(f"Initialized {backend} parallel processor with {self.n_jobs} jobs")
+        self._executor = None
+        self._client = None
+        
+        logger.info(f"Initialized {self.config.backend.value} parallel processor "
+                   f"with {self.config.n_jobs} jobs")
+    
+    def __enter__(self):
+        """Context manager entry."""
+        self._setup_backend()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self._cleanup_backend()
+    
+    def _setup_backend(self):
+        """Setup the parallel backend."""
+        if self.config.backend == BackendType.DASK:
+            self._setup_dask()
+        elif self.config.backend == BackendType.RAY:
+            self._setup_ray()
+    
+    def _cleanup_backend(self):
+        """Cleanup the parallel backend."""
+        if self._executor is not None:
+            self._executor.shutdown()
+        
+        if self._client is not None:
+            if self.config.backend == BackendType.DASK:
+                self._client.close()
+            elif self.config.backend == BackendType.RAY:
+                ray.shutdown()
+    
+    def _setup_dask(self):
+        """Setup Dask client."""
+        if not DASK_AVAILABLE:
+            raise ImportError("Dask not installed")
+        
+        self._client = Client(
+            n_workers=self.config.dask_n_workers or self.config.n_jobs,
+            threads_per_worker=self.config.dask_threads_per_worker or 1,
+            processes=self.config.dask_scheduler == "processes",
+            dashboard_address=self.config.dask_dashboard_address
+        )
+        
+        logger.info(f"Dask dashboard available at: {self._client.dashboard_link}")
+    
+    def _setup_ray(self):
+        """Setup Ray."""
+        if not RAY_AVAILABLE:
+            raise ImportError("Ray not installed")
+        
+        ray.init(
+            address=self.config.ray_address,
+            num_cpus=self.config.ray_num_cpus,
+            num_gpus=self.config.ray_num_gpus,
+            object_store_memory=self.config.ray_object_store_memory,
+            ignore_reinit_error=True
+        )
     
     def map(self, func: Callable, iterable: Iterable, 
             chunksize: Optional[int] = None,
@@ -75,129 +254,737 @@ class ParallelProcessor:
             func: Function to apply
             iterable: Input iterable
             chunksize: Chunk size for processing
-            **kwargs: Additional arguments for func
+            **kwargs: Additional arguments
             
         Returns:
             List of results
         """
-        if kwargs:
-            func = partial(func, **kwargs)
+        chunksize = chunksize or self.config.chunk_size
         
-        total = len(list(iterable)) if hasattr(iterable, '__len__') else None
-        
-        if self.backend == 'multiprocessing':
-            return self._map_multiprocessing(func, iterable, chunksize, total)
-        elif self.backend == 'threading':
-            return self._map_threading(func, iterable, chunksize, total)
-        elif self.backend == 'dask':
+        if self.config.backend == BackendType.MULTIPROCESSING:
+            return self._map_multiprocessing(func, iterable, chunksize)
+        elif self.config.backend == BackendType.THREADING:
+            return self._map_threading(func, iterable, chunksize)
+        elif self.config.backend == BackendType.DASK:
             return self._map_dask(func, iterable, chunksize)
+        elif self.config.backend == BackendType.RAY:
+            return self._map_ray(func, iterable, chunksize)
+        elif self.config.backend == BackendType.JOBLIB:
+            return self._map_joblib(func, iterable, chunksize)
         else:
-            raise ValueError(f"Unknown backend: {self.backend}")
+            raise ValueError(f"Unsupported backend: {self.config.backend}")
     
-    def _map_multiprocessing(self, func: Callable, iterable: Iterable, 
-                           chunksize: Optional[int], total: Optional[int]) -> List[Any]:
+    def _map_multiprocessing(self, func: Callable, iterable: Iterable,
+                            chunksize: Optional[int]) -> List[Any]:
         """Map using multiprocessing."""
-        with Pool(self.n_jobs) as pool:
-            if self.verbose and total:
+        ctx = mp.get_context(self.config.multiprocessing_context)
+        
+        with ctx.Pool(self.config.n_jobs) as pool:
+            if self.config.show_progress:
+                items = list(iterable)
                 results = list(tqdm(
-                    pool.imap(func, iterable, chunksize=chunksize or 1),
-                    total=total,
+                    pool.imap(func, items, chunksize=chunksize),
+                    total=len(items),
                     desc="Processing"
                 ))
             else:
                 results = pool.map(func, iterable, chunksize=chunksize)
+        
         return results
     
     def _map_threading(self, func: Callable, iterable: Iterable,
-                      chunksize: Optional[int], total: Optional[int]) -> List[Any]:
+                      chunksize: Optional[int]) -> List[Any]:
         """Map using threading."""
-        results = []
-        with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
-            futures = [executor.submit(func, item) for item in iterable]
-            
-            if self.verbose and total:
-                for future in tqdm(as_completed(futures), total=total, desc="Processing"):
+        with ThreadPoolExecutor(
+            max_workers=self.config.n_jobs,
+            thread_name_prefix=self.config.thread_name_prefix
+        ) as executor:
+            if self.config.show_progress:
+                items = list(iterable)
+                futures = [executor.submit(func, item) for item in items]
+                results = []
+                
+                for future in tqdm(as_completed(futures), total=len(futures),
+                                 desc="Processing"):
                     results.append(future.result())
             else:
-                for future in as_completed(futures):
-                    results.append(future.result())
+                results = list(executor.map(func, iterable))
         
         return results
     
     def _map_dask(self, func: Callable, iterable: Iterable,
                   chunksize: Optional[int]) -> List[Any]:
-        """Map using dask."""
-        try:
-            import dask
-            from dask import delayed, compute
-            from dask.distributed import Client
-            
-            # Create delayed tasks
-            tasks = [delayed(func)(item) for item in iterable]
-            
-            # Compute in parallel
-            with Client(n_workers=self.n_jobs, threads_per_worker=1, 
-                       processes=True, silence_logs=logging.ERROR) as client:
-                results = compute(*tasks, scheduler='distributed')
-            
-            return list(results)
-        except ImportError:
-            raise ImportError("Dask is required for dask backend. Install with: pip install dask[distributed]")
-    
-    def apply_along_axis(self, func: Callable, array: np.ndarray, 
-                        axis: int = 0) -> np.ndarray:
-        """
-        Apply function along array axis in parallel.
+        """Map using Dask."""
+        if not DASK_AVAILABLE:
+            raise ImportError("Dask not installed")
         
-        Args:
-            func: Function to apply
-            array: Input array
-            axis: Axis along which to apply
-            
-        Returns:
-            Result array
-        """
-        # Move axis to position 0
-        array = np.moveaxis(array, axis, 0)
+        # Convert to Dask collection
+        items = list(iterable)
+        futures = self._client.map(func, items)
         
-        # Apply function to each slice
-        results = self.map(func, array)
-        
-        # Stack results and move axis back
-        result = np.stack(results)
-        return np.moveaxis(result, 0, axis)
-    
-    def apply_dataframe(self, func: Callable, df: pd.DataFrame,
-                       axis: int = 0, **kwargs) -> pd.DataFrame:
-        """
-        Apply function to DataFrame in parallel.
-        
-        Args:
-            func: Function to apply
-            df: Input DataFrame
-            axis: Axis (0 for rows, 1 for columns)
-            **kwargs: Additional arguments for func
-            
-        Returns:
-            Result DataFrame
-        """
-        if axis == 0:
-            # Split by rows
-            chunks = np.array_split(df, self.n_jobs)
-            func_partial = partial(func, **kwargs) if kwargs else func
-            results = self.map(func_partial, chunks)
-            return pd.concat(results, axis=0)
+        if self.config.show_progress:
+            results = []
+            for future in tqdm(dask_as_completed(futures), total=len(futures),
+                             desc="Processing"):
+                results.append(future.result())
         else:
-            # Apply to each column
-            results = {}
-            for col in df.columns:
-                results[col] = func(df[col], **kwargs)
-            return pd.DataFrame(results)
+            results = self._client.gather(futures)
+        
+        return results
+    
+    def _map_ray(self, func: Callable, iterable: Iterable,
+                 chunksize: Optional[int]) -> List[Any]:
+        """Map using Ray."""
+        if not RAY_AVAILABLE:
+            raise ImportError("Ray not installed")
+        
+        # Create Ray remote function
+        remote_func = ray.remote(func)
+        
+        # Submit tasks
+        items = list(iterable)
+        futures = [remote_func.remote(item) for item in items]
+        
+        # Get results
+        if self.config.show_progress:
+            results = []
+            with tqdm(total=len(futures), desc="Processing") as pbar:
+                while futures:
+                    ready, futures = ray.wait(futures, num_returns=1)
+                    results.extend(ray.get(ready))
+                    pbar.update(1)
+        else:
+            results = ray.get(futures)
+        
+        return results
+    
+    def _map_joblib(self, func: Callable, iterable: Iterable,
+                    chunksize: Optional[int]) -> List[Any]:
+        """Map using joblib."""
+        from joblib import Parallel, delayed
+        
+        if self.config.show_progress:
+            results = Parallel(n_jobs=self.config.n_jobs, verbose=10)(
+                delayed(func)(item) for item in iterable
+            )
+        else:
+            results = Parallel(n_jobs=self.config.n_jobs)(
+                delayed(func)(item) for item in iterable
+            )
+        
+        return results
+    
+    def starmap(self, func: Callable, iterable: Iterable[Tuple],
+                chunksize: Optional[int] = None) -> List[Any]:
+        """
+        Parallel starmap operation.
+        
+        Args:
+            func: Function to apply
+            iterable: Iterable of argument tuples
+            chunksize: Chunk size
+            
+        Returns:
+            List of results
+        """
+        # Convert starmap to map
+        def wrapper(args):
+            return func(*args)
+        
+        return self.map(wrapper, iterable, chunksize)
+    
+    def apply_async(self, func: Callable, args: Tuple = (),
+                    kwargs: Dict[str, Any] = None) -> Any:
+        """
+        Apply function asynchronously.
+        
+        Args:
+            func: Function to apply
+            args: Positional arguments
+            kwargs: Keyword arguments
+            
+        Returns:
+            Future/AsyncResult
+        """
+        kwargs = kwargs or {}
+        
+        if self.config.backend == BackendType.MULTIPROCESSING:
+            ctx = mp.get_context(self.config.multiprocessing_context)
+            with ctx.Pool(1) as pool:
+                return pool.apply_async(func, args, kwargs)
+        elif self.config.backend == BackendType.THREADING:
+            executor = ThreadPoolExecutor(max_workers=1)
+            return executor.submit(func, *args, **kwargs)
+        elif self.config.backend == BackendType.DASK:
+            return self._client.submit(func, *args, **kwargs)
+        elif self.config.backend == BackendType.RAY:
+            remote_func = ray.remote(func)
+            return remote_func.remote(*args, **kwargs)
+        else:
+            # Fallback to synchronous
+            return func(*args, **kwargs)
+    
+    def reduce(self, func: Callable, iterable: Iterable,
+               initializer: Any = None) -> Any:
+        """
+        Parallel reduce operation.
+        
+        Args:
+            func: Reduce function
+            iterable: Input iterable
+            initializer: Initial value
+            
+        Returns:
+            Reduced result
+        """
+        # Split into chunks
+        items = list(iterable)
+        chunk_size = max(1, len(items) // self.config.n_jobs)
+        chunks = [items[i:i + chunk_size] 
+                 for i in range(0, len(items), chunk_size)]
+        
+        # Reduce each chunk
+        def chunk_reduce(chunk):
+            if initializer is not None:
+                return functools.reduce(func, chunk, initializer)
+            else:
+                return functools.reduce(func, chunk)
+        
+        # Parallel reduce on chunks
+        chunk_results = self.map(chunk_reduce, chunks)
+        
+        # Final reduce
+        if initializer is not None:
+            return functools.reduce(func, chunk_results, initializer)
+        else:
+            return functools.reduce(func, chunk_results)
 
 
-def parallel_apply(df: pd.DataFrame, func: Callable, 
-                  axis: int = 1, n_jobs: int = -1,
-                  backend: str = 'multiprocessing') -> pd.Series:
+class ChunkProcessor:
+    """
+    Process large datasets in chunks with parallel execution.
+    
+    This class is optimized for processing datasets that don't fit in memory
+    by processing them in smaller chunks.
+    """
+    
+    def __init__(self,
+                 chunk_size: int = 10000,
+                 n_jobs: int = -1,
+                 backend: str = "multiprocessing",
+                 overlap: int = 0):
+        """
+        Initialize ChunkProcessor.
+        
+        Args:
+            chunk_size: Size of each chunk
+            n_jobs: Number of parallel jobs
+            backend: Processing backend
+            overlap: Number of overlapping rows between chunks
+        """
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.processor = ParallelProcessor(n_jobs=n_jobs, backend=backend)
+        self.stats = {
+            'chunks_processed': 0,
+            'total_rows': 0,
+            'processing_time': 0,
+            'errors': []
+        }
+    
+    def process_file(self,
+                    filepath: str,
+                    func: Callable[[pd.DataFrame], pd.DataFrame],
+                    output_path: Optional[str] = None,
+                    file_format: str = 'csv',
+                    **read_kwargs) -> Optional[pd.DataFrame]:
+        """
+        Process a large file in chunks.
+        
+        Args:
+            filepath: Input file path
+            func: Function to apply to each chunk
+            output_path: Output file path (if None, returns DataFrame)
+            file_format: File format
+            **read_kwargs: Arguments for file reading
+            
+        Returns:
+            Processed DataFrame if output_path is None
+        """
+        start_time = time.time()
+        
+        # Create chunk reader
+        if file_format == 'csv':
+            reader = pd.read_csv(filepath, chunksize=self.chunk_size, **read_kwargs)
+        elif file_format == 'json':
+            reader = pd.read_json(filepath, lines=True, 
+                                chunksize=self.chunk_size, **read_kwargs)
+        else:
+            raise ValueError(f"Unsupported format for chunked reading: {file_format}")
+        
+        # Process chunks
+        results = []
+        temp_files = []
+        
+        try:
+            for i, chunk in enumerate(reader):
+                # Add overlap from previous chunk if needed
+                if self.overlap > 0 and i > 0 and results:
+                    prev_tail = results[-1].tail(self.overlap)
+                    chunk = pd.concat([prev_tail, chunk], ignore_index=True)
+                
+                # Process chunk
+                try:
+                    processed = func(chunk)
+                    
+                    if output_path:
+                        # Save to temporary file
+                        temp_file = f"{output_path}.tmp.{i}"
+                        processed.to_csv(temp_file, index=False)
+                        temp_files.append(temp_file)
+                    else:
+                        results.append(processed)
+                    
+                    self.stats['chunks_processed'] += 1
+                    self.stats['total_rows'] += len(chunk)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing chunk {i}: {e}")
+                    self.stats['errors'].append({'chunk': i, 'error': str(e)})
+                    if not self.processor.config.ignore_errors:
+                        raise
+            
+            # Combine results
+            if output_path:
+                # Combine temporary files
+                self._combine_temp_files(temp_files, output_path, file_format)
+                return None
+            else:
+                return pd.concat(results, ignore_index=True)
+        
+        finally:
+            # Cleanup temp files
+            for temp_file in temp_files:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            
+            self.stats['processing_time'] = time.time() - start_time
+    
+    def process_dataframe(self,
+                         df: pd.DataFrame,
+                         func: Callable[[pd.DataFrame], pd.DataFrame],
+                         combine_func: Optional[Callable] = None) -> pd.DataFrame:
+        """
+        Process DataFrame in chunks.
+        
+        Args:
+            df: Input DataFrame
+            func: Function to apply to each chunk
+            combine_func: Function to combine results
+            
+        Returns:
+            Processed DataFrame
+        """
+        n_chunks = (len(df) + self.chunk_size - 1) // self.chunk_size
+        
+        # Create chunks
+        chunks = []
+        for i in range(n_chunks):
+            start = i * self.chunk_size - (self.overlap if i > 0 else 0)
+            end = min((i + 1) * self.chunk_size, len(df))
+            chunk = df.iloc[start:end]
+            chunks.append(chunk)
+        
+        # Process chunks in parallel
+        results = self.processor.map(func, chunks)
+        
+        # Combine results
+        if combine_func:
+            return combine_func(results)
+        else:
+            return pd.concat(results, ignore_index=True)
+    
+    def process_iterator(self,
+                        iterator: Iterable[pd.DataFrame],
+                        func: Callable[[pd.DataFrame], pd.DataFrame],
+                        buffer_size: int = 10) -> Iterable[pd.DataFrame]:
+        """
+        Process iterator of DataFrames with buffering.
+        
+        Args:
+            iterator: Iterator of DataFrames
+            func: Function to apply
+            buffer_size: Number of chunks to buffer
+            
+        Yields:
+            Processed DataFrames
+        """
+        buffer = []
+        
+        for chunk in iterator:
+            buffer.append(chunk)
+            
+            if len(buffer) >= buffer_size:
+                # Process buffer in parallel
+                results = self.processor.map(func, buffer)
+                
+                for result in results:
+                    yield result
+                
+                buffer = []
+        
+        # Process remaining buffer
+        if buffer:
+            results = self.processor.map(func, buffer)
+            for result in results:
+                yield result
+    
+    def _combine_temp_files(self, temp_files: List[str], 
+                           output_path: str, file_format: str):
+        """Combine temporary files into final output."""
+        if file_format == 'csv':
+            # Read and combine CSV files
+            dfs = []
+            for i, temp_file in enumerate(temp_files):
+                df = pd.read_csv(temp_file)
+                dfs.append(df)
+            
+            combined = pd.concat(dfs, ignore_index=True)
+            combined.to_csv(output_path, index=False)
+        
+        elif file_format == 'parquet':
+            # For parquet, we can append
+            for i, temp_file in enumerate(temp_files):
+                df = pd.read_csv(temp_file)
+                if i == 0:
+                    df.to_parquet(output_path, index=False)
+                else:
+                    df.to_parquet(output_path, index=False, engine='fastparquet',
+                                 append=True)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get processing statistics."""
+        stats = self.stats.copy()
+        if stats['processing_time'] > 0:
+            stats['rows_per_second'] = stats['total_rows'] / stats['processing_time']
+        return stats
+
+
+class DistributedProcessor:
+    """
+    Distributed processing across multiple machines or clusters.
+    
+    Supports Dask and Ray for distributed computing.
+    """
+    
+    def __init__(self,
+                 backend: str = "dask",
+                 cluster_address: Optional[str] = None,
+                 n_workers: Optional[int] = None,
+                 worker_memory: str = "4GB",
+                 dashboard_port: int = 8787):
+        """
+        Initialize DistributedProcessor.
+        
+        Args:
+            backend: Distributed backend ('dask' or 'ray')
+            cluster_address: Cluster address (None for local)
+            n_workers: Number of workers
+            worker_memory: Memory per worker
+            dashboard_port: Dashboard port
+        """
+        self.backend = backend
+        self.cluster_address = cluster_address
+        self.n_workers = n_workers
+        self.worker_memory = worker_memory
+        self.dashboard_port = dashboard_port
+        self.client = None
+        
+        self._setup_cluster()
+    
+    def _setup_cluster(self):
+        """Setup distributed cluster."""
+        if self.backend == "dask":
+            self._setup_dask_cluster()
+        elif self.backend == "ray":
+            self._setup_ray_cluster()
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}")
+    
+    def _setup_dask_cluster(self):
+        """Setup Dask cluster."""
+        if not DASK_AVAILABLE:
+            raise ImportError("Dask not installed")
+        
+        if self.cluster_address:
+            # Connect to existing cluster
+            self.client = Client(self.cluster_address)
+        else:
+            # Create local cluster
+            from dask.distributed import LocalCluster
+            
+            cluster = LocalCluster(
+                n_workers=self.n_workers,
+                threads_per_worker=1,
+                memory_limit=self.worker_memory,
+                dashboard_address=f":{self.dashboard_port}"
+            )
+            self.client = Client(cluster)
+        
+        logger.info(f"Dask dashboard: {self.client.dashboard_link}")
+    
+    def _setup_ray_cluster(self):
+        """Setup Ray cluster."""
+        if not RAY_AVAILABLE:
+            raise ImportError("Ray not installed")
+        
+        if self.cluster_address:
+            ray.init(address=self.cluster_address)
+        else:
+            ray.init(
+                num_cpus=self.n_workers,
+                dashboard_port=self.dashboard_port
+            )
+    
+    def process_dataframe(self,
+                         df: pd.DataFrame,
+                         func: Callable,
+                         partition_col: Optional[str] = None,
+                         n_partitions: Optional[int] = None) -> pd.DataFrame:
+        """
+        Process DataFrame in distributed fashion.
+        
+        Args:
+            df: Input DataFrame
+            func: Function to apply
+            partition_col: Column to partition by
+            n_partitions: Number of partitions
+            
+        Returns:
+            Processed DataFrame
+        """
+        if self.backend == "dask":
+            return self._process_dask_dataframe(df, func, partition_col, n_partitions)
+        elif self.backend == "ray":
+            return self._process_ray_dataframe(df, func, partition_col, n_partitions)
+    
+    def _process_dask_dataframe(self, df: pd.DataFrame, func: Callable,
+                               partition_col: Optional[str],
+                               n_partitions: Optional[int]) -> pd.DataFrame:
+        """Process using Dask."""
+        # Convert to Dask DataFrame
+        n_partitions = n_partitions or self.n_workers or mp.cpu_count()
+        ddf = dd.from_pandas(df, npartitions=n_partitions)
+        
+        if partition_col:
+            # Repartition by column
+            ddf = ddf.set_index(partition_col)
+        
+        # Apply function
+        result_ddf = ddf.map_partitions(func)
+        
+        # Compute and return
+        return result_ddf.compute()
+    
+    def _process_ray_dataframe(self, df: pd.DataFrame, func: Callable,
+                              partition_col: Optional[str],
+                              n_partitions: Optional[int]) -> pd.DataFrame:
+        """Process using Ray."""
+        n_partitions = n_partitions or self.n_workers or mp.cpu_count()
+        
+        # Split DataFrame
+        if partition_col:
+            groups = df.groupby(partition_col)
+            partitions = [group for _, group in groups]
+        else:
+            chunk_size = len(df) // n_partitions
+            partitions = [df.iloc[i:i + chunk_size] 
+                         for i in range(0, len(df), chunk_size)]
+        
+        # Create Ray tasks
+        @ray.remote
+        def process_partition(partition):
+            return func(partition)
+        
+        # Process partitions
+        futures = [process_partition.remote(part) for part in partitions]
+        results = ray.get(futures)
+        
+        # Combine results
+        return pd.concat(results, ignore_index=True)
+    
+    def process_files(self,
+                     file_pattern: str,
+                     func: Callable,
+                     output_dir: str,
+                     file_format: str = "parquet") -> None:
+        """
+        Process multiple files in distributed fashion.
+        
+        Args:
+            file_pattern: Glob pattern for files
+            func: Function to apply to each file
+            output_dir: Output directory
+            file_format: Output format
+        """
+        import glob
+        
+        files = glob.glob(file_pattern)
+        logger.info(f"Processing {len(files)} files")
+        
+        if self.backend == "dask":
+            self._process_files_dask(files, func, output_dir, file_format)
+        elif self.backend == "ray":
+            self._process_files_ray(files, func, output_dir, file_format)
+    
+    def _process_files_dask(self, files: List[str], func: Callable,
+                           output_dir: str, file_format: str):
+        """Process files using Dask."""
+        @dask.delayed
+        def process_file(filepath):
+            df = pd.read_csv(filepath)
+            result = func(df)
+            
+            filename = os.path.basename(filepath)
+            output_path = os.path.join(output_dir, filename)
+            
+            if file_format == "parquet":
+                result.to_parquet(output_path)
+            else:
+                result.to_csv(output_path, index=False)
+            
+            return output_path
+        
+        # Create delayed tasks
+        tasks = [process_file(f) for f in files]
+        
+        # Execute
+        results = dask.compute(*tasks)
+        logger.info(f"Processed {len(results)} files")
+    
+    def _process_files_ray(self, files: List[str], func: Callable,
+                          output_dir: str, file_format: str):
+        """Process files using Ray."""
+        @ray.remote
+        def process_file(filepath):
+            df = pd.read_csv(filepath)
+            result = func(df)
+            
+            filename = os.path.basename(filepath)
+            output_path = os.path.join(output_dir, filename)
+            
+            if file_format == "parquet":
+                result.to_parquet(output_path)
+            else:
+                result.to_csv(output_path, index=False)
+            
+            return output_path
+        
+        # Create Ray tasks
+        futures = [process_file.remote(f) for f in files]
+        
+        # Execute
+        results = ray.get(futures)
+        logger.info(f"Processed {len(results)} files")
+    
+    def map_reduce(self,
+                   data: Any,
+                   map_func: Callable,
+                   reduce_func: Callable,
+                   key_func: Optional[Callable] = None) -> Any:
+        """
+        Distributed map-reduce operation.
+        
+        Args:
+            data: Input data
+            map_func: Map function
+            reduce_func: Reduce function
+            key_func: Optional key extraction function
+            
+        Returns:
+            Reduced result
+        """
+        if self.backend == "dask":
+            return self._map_reduce_dask(data, map_func, reduce_func, key_func)
+        elif self.backend == "ray":
+            return self._map_reduce_ray(data, map_func, reduce_func, key_func)
+    
+    def _map_reduce_dask(self, data: Any, map_func: Callable,
+                        reduce_func: Callable, key_func: Optional[Callable]) -> Any:
+        """Map-reduce using Dask."""
+        from dask import bag as db
+        
+        # Create Dask bag
+        bag = db.from_sequence(data, partition_size=1000)
+        
+        # Map
+        mapped = bag.map(map_func)
+        
+        # Group by key if provided
+        if key_func:
+            grouped = mapped.groupby(key_func)
+            # Reduce each group
+            result = grouped.map(lambda x: reduce_func(x[1])).compute()
+        else:
+            # Global reduce
+            result = mapped.fold(reduce_func).compute()
+        
+        return result
+    
+    def _map_reduce_ray(self, data: Any, map_func: Callable,
+                       reduce_func: Callable, key_func: Optional[Callable]) -> Any:
+        """Map-reduce using Ray."""
+        # Map phase
+        @ray.remote
+        def ray_map(item):
+            return map_func(item)
+        
+        map_futures = [ray_map.remote(item) for item in data]
+        mapped_results = ray.get(map_futures)
+        
+        # Group by key if provided
+        if key_func:
+            grouped = defaultdict(list)
+            for result in mapped_results:
+                key = key_func(result)
+                grouped[key].append(result)
+            
+            # Reduce each group
+            @ray.remote
+            def ray_reduce_group(group):
+                return reduce_func(group)
+            
+            reduce_futures = [ray_reduce_group.remote(group) 
+                            for group in grouped.values()]
+            results = ray.get(reduce_futures)
+            
+            return dict(zip(grouped.keys(), results))
+        else:
+            # Global reduce
+            @ray.remote
+            def ray_reduce(items):
+                return reduce_func(items)
+            
+            return ray.get(ray_reduce.remote(mapped_results))
+    
+    def shutdown(self):
+        """Shutdown distributed cluster."""
+        if self.backend == "dask" and self.client:
+            self.client.close()
+        elif self.backend == "ray":
+            ray.shutdown()
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.shutdown()
+
+
+def parallel_apply(df: pd.DataFrame, func: Callable, axis: int = 0,
+                  n_jobs: int = -1, backend: str = 'multiprocessing') -> pd.Series:
     """
     Parallel version of DataFrame.apply().
     
@@ -221,6 +1008,73 @@ def parallel_apply(df: pd.DataFrame, func: Callable,
         # Apply to columns
         results = processor.map(func, [df[col] for col in df.columns])
         return pd.Series(results, index=df.columns)
+
+
+def parallel_map(func: Callable[..., T], 
+                *iterables: Iterable,
+                n_jobs: int = -1,
+                backend: str = 'multiprocessing',
+                chunk_size: Optional[int] = None,
+                progress: bool = True,
+                error_handler: Optional[Callable] = None,
+                timeout: Optional[float] = None) -> List[T]:
+    """
+    Enhanced parallel map with multiple iterables and error handling.
+    
+    Args:
+        func: Function to apply
+        *iterables: Input iterables (like map)
+        n_jobs: Number of parallel jobs
+        backend: Backend to use
+        chunk_size: Chunk size for processing
+        progress: Show progress bar
+        error_handler: Function to handle errors
+        timeout: Timeout for each task
+        
+    Returns:
+        List of results
+    
+    Example:
+        >>> def add(x, y):
+        ...     return x + y
+        >>> results = parallel_map(add, [1, 2, 3], [4, 5, 6], n_jobs=2)
+        >>> print(results)  # [5, 7, 9]
+    """
+    # Create configuration
+    config = ParallelConfig(
+        n_jobs=n_jobs,
+        backend=backend,
+        chunk_size=chunk_size,
+        show_progress=progress,
+        timeout=timeout
+    )
+    
+    # Handle multiple iterables
+    if len(iterables) == 1:
+        items = list(iterables[0])
+    else:
+        items = list(zip(*iterables))
+        # Wrap function to handle tuple arguments
+        original_func = func
+        func = lambda args: original_func(*args)
+    
+    # Process with error handling
+    if error_handler:
+        def safe_func(item):
+            try:
+                return func(item)
+            except Exception as e:
+                return error_handler(item, e)
+        
+        process_func = safe_func
+    else:
+        process_func = func
+    
+    # Create processor and execute
+    with ParallelProcessor(config=config) as processor:
+        results = processor.map(process_func, items)
+    
+    return results
 
 
 def parallel_groupby_apply(df: pd.DataFrame, groupby_cols: Union[str, List[str]],
@@ -368,7 +1222,7 @@ class SharedMemoryArray:
         """
         self.shape = shape
         self.dtype = dtype
-        self.size = np.prod(shape)
+        self.size = int(np.prod(shape))
         
         # Create shared memory
         self.shared_array = mp.Array(
@@ -561,6 +1415,7 @@ def parallel_save_partitions(df: pd.DataFrame, output_dir: str,
 def example_parallel_processing():
     """Example of parallel processing utilities."""
     import time
+    import functools
     
     # Example function
     def expensive_computation(x):
@@ -588,6 +1443,58 @@ def example_parallel_processing():
     print(f"  Sequential time: {sequential_time:.2f}s")
     print(f"  Speedup: {sequential_time / parallel_time:.2f}x")
     
+    # Test parallel_map with multiple iterables
+    print("\nTesting parallel_map...")
+    def add(x, y):
+        return x + y
+    
+    results = parallel_map(add, range(10), range(10, 20), n_jobs=4)
+    print(f"  Results: {results[:5]}...")
+    
+    # Test ChunkProcessor
+    print("\nTesting ChunkProcessor...")
+    chunk_processor = ChunkProcessor(chunk_size=100, n_jobs=4)
+    
+    df = pd.DataFrame({
+        'A': np.random.randn(1000),
+        'B': np.random.randn(1000)
+    })
+    
+    def process_chunk(chunk):
+        return chunk.assign(C=chunk['A'] + chunk['B'])
+    
+    result_df = chunk_processor.process_dataframe(df, process_chunk)
+    print(f"  Result shape: {result_df.shape}")
+    
+    # Test ParallelConfig
+    print("\nTesting ParallelConfig...")
+    config = ParallelConfig(
+        n_jobs=4,
+        backend=BackendType.MULTIPROCESSING,
+        chunk_size=50,
+        show_progress=True
+    )
+    
+    with ParallelProcessor(config=config) as proc:
+        results = proc.map(expensive_computation, data[:10])
+        print(f"  Config-based results: {results[:5]}...")
+    
+    # Test DistributedProcessor (if Dask available)
+    if DASK_AVAILABLE:
+        print("\nTesting DistributedProcessor...")
+        with DistributedProcessor(backend="dask", n_workers=2) as dist_proc:
+            df_large = pd.DataFrame({
+                'A': np.random.randn(10000),
+                'B': np.random.randn(10000),
+                'group': np.random.choice(['X', 'Y', 'Z'], 10000)
+            })
+            
+            def process_partition(part):
+                return part.assign(mean_A=part['A'].mean())
+            
+            result = dist_proc.process_dataframe(df_large, process_partition)
+            print(f"  Distributed result shape: {result.shape}")
+    
     # Test parallel DataFrame operations
     print("\nTesting parallel DataFrame operations...")
     df = pd.DataFrame({
@@ -611,6 +1518,8 @@ def example_parallel_processing():
     
     decorated_results = process_item(data)
     print(f"  Decorated results: {decorated_results[:5]}...")
+    
+    print("\nAll tests completed!")
 
 
 if __name__ == "__main__":
