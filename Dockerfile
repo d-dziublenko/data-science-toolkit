@@ -2,7 +2,7 @@
 # This Dockerfile creates an optimized container for running data science workloads
 
 # Stage 1: Base image with system dependencies
-FROM python:3.9-slim as base
+FROM python:3.13-slim as base
 
 # Set environment variables to optimize Python in container
 ENV PYTHONUNBUFFERED=1 \
