@@ -6,6 +6,7 @@ email - d.dziublenko@gmail.com
 license - AGPL-3.0 license
 git clone link - https://github.com/d-dziublenko/data-science-toolkit.git
 web link - https://github.com/d-dziublenko/data-science-toolkit
+year - 2025
 
 data-science-toolkit/
 │
