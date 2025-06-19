@@ -1,0 +1,189 @@
+# Development Dependencies for Data Science Toolkit
+# This file contains all development dependencies needed for:
+# - Code formatting and linting
+# - Testing and coverage
+# - Documentation
+# - Development utilities
+
+# ==============================================
+# Code Formatting and Quality Tools
+# ==============================================
+
+# Black - The uncompromising code formatter
+# Ensures consistent code style across the entire project
+black==24.1.0
+
+# isort - Sorts and organizes imports
+# Configured to work with Black's formatting style
+isort==5.13.2
+
+# flake8 - Style guide enforcement
+# Catches errors and style issues that Black doesn't handle
+flake8==7.0.0
+
+# Additional flake8 plugins for better code quality
+flake8-docstrings==1.7.0  # Checks docstring presence and style
+flake8-bugbear==24.1.17   # Finds likely bugs and design problems
+flake8-comprehensions==3.14.0  # Writes better list/set/dict comprehensions
+flake8-simplify==0.21.0   # Suggests code simplifications
+
+# mypy - Static type checker
+# Helps catch type-related bugs before runtime
+mypy==1.8.0
+types-requests==2.31.0.20240106  # Type stubs for requests
+types-setuptools==69.0.0.20240125  # Type stubs for setuptools
+
+# pylint - Another Python linter with different checks than flake8
+# Provides additional code quality insights
+pylint==3.0.3
+
+# bandit - Security linter
+# Finds common security issues in Python code
+bandit==1.7.6
+
+# ==============================================
+# Testing and Coverage Tools
+# ==============================================
+
+# pytest - The testing framework
+# More powerful and flexible than unittest
+pytest==7.4.4
+pytest-cov==4.1.0  # Coverage plugin for pytest
+pytest-mock==3.12.0  # Mocking support for pytest
+pytest-asyncio==0.21.1  # Async test support
+pytest-timeout==2.2.0  # Timeout tests that take too long
+pytest-xdist==3.5.0  # Run tests in parallel
+pytest-benchmark==4.0.0  # Performance testing
+
+# coverage - Code coverage measurement
+# Helps ensure tests cover all code paths
+coverage[toml]==7.4.0
+
+# hypothesis - Property-based testing
+# Generates test cases automatically
+hypothesis==6.92.2
+
+# tox - Test automation tool
+# Runs tests in multiple environments
+tox==4.11.4
+
+# ==============================================
+# Documentation Tools
+# ==============================================
+
+# Sphinx - Documentation generator
+# Creates beautiful documentation from docstrings
+sphinx==7.2.6
+sphinx-rtd-theme==2.0.0  # Read the Docs theme
+sphinx-autodoc-typehints==1.25.2  # Better type hint support
+myst-parser==2.0.0  # Markdown support for Sphinx
+
+# ==============================================
+# Development Utilities
+# ==============================================
+
+# pre-commit - Git hooks framework
+# Runs checks before every commit
+pre-commit==3.6.0
+
+# ipython - Enhanced Python shell
+# Better REPL for interactive development
+ipython==8.19.0
+
+# jupyter - For notebook development
+# Useful for data science exploration
+jupyter==1.0.0
+notebook==7.0.7
+jupyterlab==4.0.10
+
+# ipdb - IPython debugger
+# Better debugging experience than pdb
+ipdb==0.13.13
+
+# python-dotenv - Load environment variables from .env
+# Keeps sensitive data out of code
+python-dotenv==1.0.0
+
+# watchdog - File system watcher
+# Useful for auto-reloading during development
+watchdog==3.0.0
+
+# ==============================================
+# Build and Packaging Tools
+# ==============================================
+
+# build - PEP 517 package builder
+# Modern way to build Python packages
+build==1.0.3
+
+# twine - Upload packages to PyPI
+# For when you're ready to share your package
+twine==4.0.2
+
+# wheel - Built-package format for Python
+# Faster installation than source distributions
+wheel==0.42.0
+
+# setuptools-scm - Manage versions using git tags
+# Automatic versioning from git
+setuptools-scm==8.0.4
+
+# ==============================================
+# Data Science Specific Dev Tools
+# ==============================================
+
+# memory-profiler - Monitor memory usage
+# Essential for optimizing data science code
+memory-profiler==0.61.0
+
+# line-profiler - Line-by-line profiling
+# Find performance bottlenecks
+line_profiler==4.1.1
+
+# py-spy - Sampling profiler for Python
+# Profile running programs without modifying code
+py-spy==0.3.14
+
+# ==============================================
+# Code Formatting Configuration Tools
+# ==============================================
+
+# pyproject-fmt - Formats pyproject.toml files
+# Keeps your project configuration tidy
+pyproject-fmt==1.5.3
+
+# ==============================================
+# Continuous Integration Helpers
+# ==============================================
+
+# nox - Flexible test automation
+# Alternative to tox with Python configuration
+nox==2023.4.22
+
+# ==============================================
+# Optional but Useful Tools
+# ==============================================
+
+# rich - Beautiful terminal formatting
+# Makes CLI output more readable during development
+rich==13.7.0
+
+# typer - Build CLI apps with type hints
+# If you're building command-line tools
+typer==0.9.0
+
+# pydantic - Data validation using type hints
+# Useful for configuration and data models
+pydantic==2.5.3
+
+# ==============================================
+# Version Control Helpers
+# ==============================================
+
+# commitizen - Standardize commit messages
+# Helps maintain a clean git history
+commitizen==3.13.0
+
+# gitpython - Python Git integration
+# Useful for automation scripts
+gitpython==3.1.41
