@@ -1,0 +1,150 @@
+# Virtual environments
+data_science_env/
+venv/
+env/
+.env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyo
+*.pyd
+.cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# Development and IDE files
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+.DS_Store
+Thumbs.db
+.vs/
+*.sublime-project
+*.sublime-workspace
+
+# Documentation source files (we'll include built docs only)
+docs/_build/
+docs/.doctrees/
+
+# Notebooks and temporary files
+.ipynb_checkpoints/
+*.ipynb
+notebooks/sandbox/
+*.tmp
+*.temp
+*.log
+logs/
+
+# Data files (these should be mounted, not included in image)
+data/raw/*
+data/processed/*
+data/external/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.db
+*.sqlite
+
+# Model files (should be stored externally)
+models/*.pkl
+models/*.h5
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.joblib
+!models/.gitkeep
+
+# Output files
+outputs/*
+!outputs/.gitkeep
+results/*
+reports/*
+
+# Test files (optional, uncomment if you don't want tests in production image)
+# tests/
+# test_*.py
+# *_test.py
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+pip-wheel-metadata/
+
+# Environment files with secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# CI/CD files (optional, include if needed in container)
+.github/
+.gitlab-ci.yml
+.travis.yml
+azure-pipelines.yml
+
+# Documentation files (optional, include only if serving docs)
+README.md
+CONTRIBUTING.md
+QUICKSTART.md
+CHANGELOG.md
+LICENSE
+
+# Package manager files
+poetry.lock
+Pipfile.lock
+
+# OS generated files
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Archive files
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Media files (if any)
+*.mp4
+*.avi
+*.mov
+*.mp3
+*.wav
+
+# Large binary files
+*.bin
+*.dat
